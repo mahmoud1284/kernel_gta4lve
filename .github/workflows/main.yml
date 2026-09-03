@@ -19,6 +19,7 @@ jobs:
       id: build
       env:
         NAME: Loganysl
+        KCFLAGS: "-Wno-error=strict-prototypes"
       with:
         arch: arm64
         compiler: clang/11/binutils
