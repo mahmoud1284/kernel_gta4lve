@@ -835,7 +835,7 @@ static void charger_dump_reg(struct charger_ic_info *info)
 		printc("[REG_0x%02x] = 0x%02x\n",i,reg_val);
 	}
 }
-struct charger_manager *charger_get_manager()
+struct charger_manager *charger_get_manager(void)
 {
 	struct power_supply *psy;
 
