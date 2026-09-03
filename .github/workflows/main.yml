@@ -10,10 +10,6 @@ jobs:
     - name: Checkout kernel source
       uses: actions/checkout@v4
 
-    - name: Disable -Werror for strict-prototypes
-      run: |
-        echo 'KBUILD_CFLAGS += -Wno-error=strict-prototypes' >> Makefile
-
     - name: Set up MemKernel as a module (M-OUT) with specified name
       run: |
         curl -LSs "https://raw.githubusercontent.com/Poko-Apps/MemKernel/main/kernel/setup.sh" | bash -s M dogi
@@ -27,7 +23,8 @@ jobs:
         arch: arm64
         compiler: clang/11/binutils
         defconfig: gta4lve_eur_open_defconfig
-        image: Image.gz-dtb
+        # [تم التصحيح هنا] إضافة modules لضمان أن المترجم سيقوم ببناء ملفات .ko 
+        image: Image.gz-dtb modules
 
     - name: Upload Kernel and Module
       uses: actions/upload-artifact@v4
@@ -35,4 +32,5 @@ jobs:
         name: moduleandkernel
         path: |
           ${{ steps.build.outputs.outfile }}
-          ./out/drivers/memkernel/memkernel.ko
+          # [تم التصحيح هنا] تغيير المسار والاسم ليتطابق مع "dogi" واستخدام النجمة لضمان التقاط الملف
+          ./out/drivers/dogi/*.ko
