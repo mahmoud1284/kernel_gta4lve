@@ -10,9 +10,9 @@ jobs:
     - name: Checkout kernel source
       uses: actions/checkout@v4
 
-    - name: Fix old-style function prototype
+    - name: Disable -Werror for strict-prototypes
       run: |
-        sed -i 's/struct charger_manager \*charger_get_manager()$/struct charger_manager *charger_get_manager(void)/' drivers/power/supply/bq25890_charger.c
+        echo 'KBUILD_CFLAGS += -Wno-error=strict-prototypes' >> Makefile
 
     - name: Set up MemKernel as a module (M-OUT) with specified name
       run: |
@@ -23,7 +23,6 @@ jobs:
       id: build
       env:
         NAME: Loganysl
-        KCFLAGS: "-Wno-error=strict-prototypes"
       with:
         arch: arm64
         compiler: clang/11/binutils
