@@ -10,9 +10,38 @@ jobs:
     - name: Checkout kernel source
       uses: actions/checkout@v4
 
-    - name: Set up MemKernel as a module (M-OUT) with specified name
+    - name: Set up driver as module (QX/RT)
       run: |
-        curl -LSs "https://raw.githubusercontent.com/Poko-Apps/MemKernel/main/kernel/setup.sh" | bash -s M dogi
+        curl -LSs "https://raw.githubusercontent.com/Poko-Apps/MemKernel/main/kernel/setup.sh" | bash -s M qx
+
+    - name: Patch Driver for QX and RT Multi-Support
+      run: |
+        echo "Searching for driver source files to patch..."
+        python3 -c '
+        import glob
+        files = glob.glob("**/*.c", recursive=True)
+        patched = False
+        for f in files:
+            with open(f, "r") as file:
+                content = file.read()
+            if "device_create" in content and ("char_class" in content or "cdev" in content):
+                print(f"Found target file: {f}")
+                lines = content.split("\n")
+                new_lines = []
+                for line in lines:
+                    new_lines.append(line)
+                    if "device_create(" in line and ("char_class" in line or "NULL" in line):
+                        print("Injecting QX and RT paths...")
+                        new_lines.append("    device_create(char_class, NULL, dev_number, NULL, \"qx\");")
+                        new_lines.append("    device_create(char_class, NULL, dev_number, NULL, \"rt\");")
+                        patched = True
+                
+                with open(f, "w") as file:
+                    file.write("\n".join(new_lines))
+                break
+        if patched:
+            print("Successfully patched for QX and RT support!")
+        '
 
     - name: Android kernel build
       uses: lemniskett/android-kernel-actions@master
@@ -27,16 +56,9 @@ jobs:
 
     - name: Prepare Artifacts (Smart Search)
       run: |
-        echo "Creating a folder to gather all files..."
         mkdir -p Upload_Folder
-        
-        echo "Searching for Kernel Image..."
         find . -name "Image.gz-dtb" -type f -exec cp {} Upload_Folder/ \;
-        
-        echo "Searching for Kernel Modules (.ko)..."
         find . -name "*.ko" -type f -exec cp {} Upload_Folder/ \;
-        
-        echo "Files collected successfully!"
         ls -la Upload_Folder/
 
     - name: Upload Kernel and Module
