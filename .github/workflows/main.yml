@@ -23,7 +23,6 @@ jobs:
         arch: arm64
         compiler: clang/11/binutils
         defconfig: gta4lve_eur_open_defconfig
-        # [تم التصحيح هنا] إضافة modules لضمان أن المترجم سيقوم ببناء ملفات .ko 
         image: Image.gz-dtb modules
 
     - name: Upload Kernel and Module
@@ -31,6 +30,5 @@ jobs:
       with:
         name: moduleandkernel
         path: |
-          ${{ steps.build.outputs.outfile }}
-          # [تم التصحيح هنا] تغيير المسار والاسم ليتطابق مع "dogi" واستخدام النجمة لضمان التقاط الملف
-          ./out/drivers/dogi/*.ko
+          out/arch/arm64/boot/Image.gz-dtb
+          out/drivers/dogi/*.ko
