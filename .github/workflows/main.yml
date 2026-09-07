@@ -25,8 +25,8 @@ jobs:
         
     - name: Download Toolchains (Clang 11.0.1 & GCC 4.9)
       run: |
-        # تحميل Clang 11.0.1 (الإصدار الرسمي r383902 الخاص بالأندرويد)
-        git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_64_clang-r383902.git clang
+        # تحميل Clang 11.0.1 من مستودعات LineageOS الرسمية (رابط عام ومستقر)
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r383902.git clang
         
         # تحميل GCC 4.9 لمعمارية 64-bit
         git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
