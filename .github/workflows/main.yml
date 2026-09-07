@@ -1,0 +1,102 @@
+name: Build gta4lve Kernel (Clang 11 + GCC 4.9 + KPM)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-latest # أحدث إصدار من سيرفرات أوبونتو
+
+    steps:
+    - name: Checkout Kernel Source
+      uses: actions/checkout@v4
+      with:
+        path: kernel_workspace
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update
+        # تثبيت الحزم الأساسية لبناء الكيرنل
+        sudo apt-get install -y build-essential bc libssl-dev libfl-dev curl git zip unzip flex bison libncurses-dev
+        
+        # محاولة تثبيت المكتبات القديمة اللازمة لتشغيل GCC 4.9 على أوبونتو الحديث
+        sudo apt-get install -y libncurses5 libtinfo5 || echo "لا يمكن العثور على الحزم القديمة، جاري المتابعة..."
+        
+    - name: Download Toolchains (Clang 11.0.1 & GCC 4.9)
+      run: |
+        # تحميل Clang 11.0.1 (الإصدار الرسمي r383902 الخاص بالأندرويد)
+        git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_64_clang-r383902.git clang
+        
+        # تحميل GCC 4.9 لمعمارية 64-bit
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
+        
+        # تحميل GCC 4.9 لمعمارية 32-bit (مطلوب لترجمة ملفات VDSO القديمة)
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
+
+    - name: Inject KernelSU-Next & KPM
+      run: |
+        cd kernel_workspace
+        
+        # جلب سورس KernelSU-Next
+        curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -
+        
+        DEFCONFIG="arch/arm64/configs/gta4lve_eur_open_defconfig"
+        
+        # إضافة خيارات KSU و KPM داخل ملف إعداداتك المخصص
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_NEXT=y" >> $DEFCONFIG
+        
+        # متطلبات KPM الأساسية لكي يعمل الـ Hook ويتم حقن الـ Modules
+        echo "CONFIG_KPM=y" >> $DEFCONFIG
+        echo "CONFIG_MODULES=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_HAVE_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
+        echo "CONFIG_KALLSYMS=y" >> $DEFCONFIG
+        echo "CONFIG_KALLSYMS_ALL=y" >> $DEFCONFIG
+
+    - name: Build the Kernel
+      run: |
+        export CLANG_DIR=$GITHUB_WORKSPACE/clang
+        export GCC64_DIR=$GITHUB_WORKSPACE/gcc64
+        export GCC32_DIR=$GITHUB_WORKSPACE/gcc32
+        
+        # إضافة المترجمات لمسار النظام الأساسي
+        export PATH=$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH
+        
+        export ARCH=arm64
+        export SUBARCH=arm64
+        
+        # تحديد Clang 11 كمترجم أساسي، و GCC 4.9 كـ Cross-Compiler
+        export CC="clang"
+        export CROSS_COMPILE="aarch64-linux-android-"
+        export CROSS_COMPILE_ARM32="arm-linux-androideabi-"
+        export CLANG_TRIPLE="aarch64-linux-gnu-"
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        
+        cd kernel_workspace
+        
+        make O=out clean
+        make O=out mrproper
+        
+        # تطبيق ملف الـ defconfig الخاص بك
+        make O=out gta4lve_eur_open_defconfig
+        
+        echo "--> جاري البناء..."
+        make O=out -j$(nproc --all) CC="clang" \
+                                    CROSS_COMPILE="aarch64-linux-android-" \
+                                    CROSS_COMPILE_ARM32="arm-linux-androideabi-"
+
+    - name: Upload Kernel Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Kernel-gta4lve-KSU-Next-KPM
+        path: |
+          kernel_workspace/out/arch/arm64/boot/Image
+          kernel_workspace/out/arch/arm64/boot/Image.gz
