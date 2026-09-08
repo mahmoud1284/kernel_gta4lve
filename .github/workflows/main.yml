@@ -17,10 +17,10 @@ jobs:
           config: gta4lve_eur_open_defconfig
           arch: arm64
 
-          # التولچينز - AOSP Clang 11.0.1 (r383902) + AOSP GCC 4.9
-          aosp-clang: true
-          aosp-clang-version: r383902b   # لاحظ: r383902 (من غير b) اتشال من مصدر جوجل، والمتاح دلوقتي هو r383902b
-          aosp-gcc: true
+          # التولچينز - proton-clang (حزمة كاملة فيها Clang + GCC cross-compilers لـ arm64/arm32)
+          # بدل aosp-clang/aosp-gcc اللي بترفض التحميل من googlesource حاليًا
+          other-clang-url: https://github.com/kdrag0n/proton-clang
+          other-clang-branch: master
 
           # KernelSU-Next
           ksu: true
