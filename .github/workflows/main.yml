@@ -11,7 +11,9 @@ jobs:
       - name: Build
         uses: vmos0/Kernel-Action@main
         with:
-          # ⚠️ غيّر ده لرابط سورس الكيرنل بتاعك الفعلي على GitHub
+          # ⚠️ لو الـ repo بتاعك Private، لازم تحط توكن جوه الرابط زي كده (بعد ما تضيف السيكريت KERNEL_TOKEN):
+          # kernel-url: https://${{ secrets.KERNEL_TOKEN }}@github.com/mahmoud1284/kernel_gta4lve
+          # لو الـ repo Public سيبه زي ما هو تحت:
           kernel-url: https://github.com/mahmoud1284/kernel_gta4lve
           kernel-branch: main   # ⚠️ غيّر لاسم الفرع الصحيح لو مختلف
           config: gta4lve_eur_open_defconfig
@@ -22,11 +24,10 @@ jobs:
           other-clang-url: https://github.com/kdrag0n/proton-clang
           other-clang-branch: master
 
-          # KernelSU-Next
+          # KernelSU الرسمي (مسار مدمج ومُختبر جوه الـ Action)
+          # لاحظ: rifsxd/KernelSU-Next اتحوّل لأرشيف وبقى غير موثوق كرابط مباشر،
+          # فبنستخدم الرسمي الأول لحد ما نتأكد إن الباقي شغال، وبعدين نرجع نجرب فورك تاني لو حبيت
           ksu: true
-          ksu-other: true
-          ksu-url: https://github.com/rifsxd/KernelSU-Next
-          ksu-version: next
 
           # المميزات الإضافية من قائمتك الأصلية
           rekernel: true      # Re-Kernel
