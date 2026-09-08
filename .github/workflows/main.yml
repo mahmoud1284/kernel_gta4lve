@@ -18,35 +18,46 @@ jobs:
       run: |
         sudo apt-get update
         # تثبيت الحزم الأساسية لبناء الكيرنل
-        sudo apt-get install -y build-essential bc libssl-dev libfl-dev curl git zip unzip flex bison libncurses-dev
-        
+        sudo apt-get install -y build-essential bc libssl-dev libfl-dev curl git zip unzip flex bison libncurses-dev wget
+
         # محاولة تثبيت المكتبات القديمة اللازمة لتشغيل GCC 4.9 على أوبونتو الحديث
         sudo apt-get install -y libncurses5 libtinfo5 || echo "لا يمكن العثور على الحزم القديمة، جاري المتابعة..."
-        
+
     - name: Download Toolchains (Clang 11.0.1 & GCC 4.9)
       run: |
-        # تحميل Clang 11.0.1 من مستودعات LineageOS الرسمية (رابط عام ومستقر)
-        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r383902.git clang
-        
-        # تحميل GCC 4.9 لمعمارية 64-bit
-        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
-        
-        # تحميل GCC 4.9 لمعمارية 32-bit (مطلوب لترجمة ملفات VDSO القديمة)
-        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
+        # تحميل مباشر من مصدر Google الرسمي (googlesource) كـ tar.gz - مفيش أي مصادقة مطلوبة
+        mkdir -p clang gcc64 gcc32
+
+        echo "--> تحميل Clang r383902 (11.0.1)..."
+        wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r383902.tar.gz" -O clang.tar.gz
+        tar -xzf clang.tar.gz -C clang
+
+        echo "--> تحميل GCC 4.9 (aarch64 - 64-bit)..."
+        wget -q "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-11.0.0_r35.tar.gz" -O gcc64.tar.gz
+        tar -xzf gcc64.tar.gz -C gcc64
+
+        echo "--> تحميل GCC 4.9 (arm - 32-bit لملفات VDSO)..."
+        wget -q "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-11.0.0_r34.tar.gz" -O gcc32.tar.gz
+        tar -xzf gcc32.tar.gz -C gcc32
+
+        echo "--> تأكيد إن المترجمات اتحملت صح"
+        ./clang/bin/clang --version
+        ./gcc64/bin/aarch64-linux-android-gcc --version
+        ./gcc32/bin/arm-linux-androideabi-gcc --version
 
     - name: Inject KernelSU-Next & KPM
       run: |
         cd kernel_workspace
-        
+
         # جلب سورس KernelSU-Next
         curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -
-        
+
         DEFCONFIG="arch/arm64/configs/gta4lve_eur_open_defconfig"
-        
+
         # إضافة خيارات KSU و KPM داخل ملف إعداداتك المخصص
         echo "CONFIG_KSU=y" >> $DEFCONFIG
         echo "CONFIG_KSU_NEXT=y" >> $DEFCONFIG
-        
+
         # متطلبات KPM الأساسية لكي يعمل الـ Hook ويتم حقن الـ Modules
         echo "CONFIG_KPM=y" >> $DEFCONFIG
         echo "CONFIG_MODULES=y" >> $DEFCONFIG
@@ -56,18 +67,24 @@ jobs:
         echo "CONFIG_KALLSYMS=y" >> $DEFCONFIG
         echo "CONFIG_KALLSYMS_ALL=y" >> $DEFCONFIG
 
+        # ZRAM بضغط LZ4 كافتراضي (مطلوب في التفاصيل)
+        echo "CONFIG_ZRAM=y" >> $DEFCONFIG
+        echo "CONFIG_ZRAM_DEF_COMP_LZ4=y" >> $DEFCONFIG
+        echo "CONFIG_CRYPTO_LZ4=y" >> $DEFCONFIG
+        echo "CONFIG_CRYPTO_LZ4HC=y" >> $DEFCONFIG
+
     - name: Build the Kernel
       run: |
         export CLANG_DIR=$GITHUB_WORKSPACE/clang
         export GCC64_DIR=$GITHUB_WORKSPACE/gcc64
         export GCC32_DIR=$GITHUB_WORKSPACE/gcc32
-        
+
         # إضافة المترجمات لمسار النظام الأساسي
         export PATH=$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH
-        
+
         export ARCH=arm64
         export SUBARCH=arm64
-        
+
         # تحديد Clang 11 كمترجم أساسي، و GCC 4.9 كـ Cross-Compiler
         export CC="clang"
         export CROSS_COMPILE="aarch64-linux-android-"
@@ -79,15 +96,15 @@ jobs:
         export OBJCOPY=llvm-objcopy
         export OBJDUMP=llvm-objdump
         export STRIP=llvm-strip
-        
+
         cd kernel_workspace
-        
+
         make O=out clean
         make O=out mrproper
-        
+
         # تطبيق ملف الـ defconfig الخاص بك
         make O=out gta4lve_eur_open_defconfig
-        
+
         echo "--> جاري البناء..."
         make O=out -j$(nproc --all) CC="clang" \
                                     CROSS_COMPILE="aarch64-linux-android-" \
