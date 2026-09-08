@@ -19,7 +19,7 @@ jobs:
 
           # التولچينز - AOSP Clang 11.0.1 (r383902) + AOSP GCC 4.9
           aosp-clang: true
-          aosp-clang-version: r383902
+          aosp-clang-version: r383902b   # لاحظ: r383902 (من غير b) اتشال من مصدر جوجل، والمتاح دلوقتي هو r383902b
           aosp-gcc: true
 
           # KernelSU-Next
