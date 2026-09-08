@@ -19,10 +19,11 @@ jobs:
           config: gta4lve_eur_open_defconfig
           arch: arm64
 
-          # التولچينز - proton-clang (حزمة كاملة فيها Clang + GCC cross-compilers لـ arm64/arm32)
-          # بدل aosp-clang/aosp-gcc اللي بترفض التحميل من googlesource حاليًا
+          # التولچينز - proton-clang للـ Clang، + aosp-gcc عشان يوفر متغير CROSS_COMPILE
+          # (الـ Action محتاجة aosp-gcc مفعّل عشان تحدد الـ cross-compiler حتى مع كلانج خارجي)
           other-clang-url: https://github.com/kdrag0n/proton-clang
           other-clang-branch: master
+          aosp-gcc: true
 
           # KernelSU الرسمي (مسار مدمج ومُختبر جوه الـ Action)
           # لاحظ: rifsxd/KernelSU-Next اتحوّل لأرشيف وبقى غير موثوق كرابط مباشر،
