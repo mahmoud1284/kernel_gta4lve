@@ -77,7 +77,7 @@ jobs:
           "$HOME/tc/clang/bin/clang" --version | head -1
           echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Integrate SukiSU-Ultra & Backport set_memory.h
+      - name: Integrate SukiSU-Ultra & Backport headers
         if: ${{ inputs.enable_ksu }}
         env:
           SUKISU_REF: ${{ inputs.sukisu_ref }}
@@ -87,7 +87,6 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/${SUKISU_REF}/kernel/setup.sh" \
             | bash -s "${SUKISU_REF}"
           
-          # Identify clone directory (usually KernelSU)
           KSU_DIR=$(find . -maxdepth 1 -type d -iname "*SU*" | head -n 1)
           echo "Found SukiSU directory at: $KSU_DIR"
           
@@ -105,27 +104,32 @@ jobs:
           echo "set_memory.h backport completed."
           
           # FIX for 'linux/static_call.h file not found' on 4.14
-          # The file kernel_includes.h in SukiSU includes static_call.h, which was introduced in 5.10.
-          # Create a dummy header so compilation doesn't fail.
           echo "Creating dummy static_call.h..."
           mkdir -p include/linux
           cat << 'EOF' > include/linux/static_call.h
           #ifndef _LINUX_STATIC_CALL_H
           #define _LINUX_STATIC_CALL_H
-          
           #include <linux/types.h>
-          
-          /* Dummy definitions for kernels < 5.10 to satisfy SukiSU compilation */
           #define DECLARE_STATIC_CALL(name, func)
           #define DEFINE_STATIC_CALL(name, func)
           #define DEFINE_STATIC_CALL_NULL(name, typename)
           #define static_call(name) (name)
           #define static_call_cond(name) (name)
           #define static_call_update(name, func) do {} while (0)
-          
           #endif
           EOF
-          echo "Dummy static_call.h created."
+          
+          # FIX for 'linux/susfs.h file not found' on Non-GKI
+          # SukiSU-Ultra builtin branch attempts to include linux/susfs.h unconditionally in kernel_includes.h
+          # We need to provide a dummy header so compilation succeeds when susfs is not actually integrated into the kernel source.
+          echo "Creating dummy susfs.h..."
+          cat << 'EOF' > include/linux/susfs.h
+          #ifndef _LINUX_SUSFS_H
+          #define _LINUX_SUSFS_H
+          /* Dummy header to satisfy SukiSU-Ultra compilation when SuSFS is not integrated */
+          #endif
+          EOF
+          echo "Dummy susfs.h created."
 
       - name: Apply Manual Hooks
         if: ${{ inputs.enable_ksu }}
