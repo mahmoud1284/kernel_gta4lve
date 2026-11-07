@@ -304,13 +304,14 @@ jobs:
           export BSP_BUILD_FAMILY=qogirl6
           export BSP_BUILD_ANDROID_OS=y
           export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
-          export DTC_OVERLAY_VTS_EXT="$PWD/tools/mkdtimg/ufdt_verify_overlay_host"
+          # NOTE: DTC_OVERLAY_VTS_EXT is intentionally NOT set. ufdt_verify_overlay_host needs the
+          # tools/lib64/*.so files, which are Git LFS pointers in this repo (not real ELF files on a
+          # normal checkout) -> "libc++.so: invalid ELF header". The VTS check is test-only.
 
           {
             echo "BSP_BUILD_FAMILY=qogirl6"
             echo "BSP_BUILD_ANDROID_OS=y"
             echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT"
-            echo "DTC_OVERLAY_VTS_EXT=$DTC_OVERLAY_VTS_EXT"
             # HOSTLOADLIBES_dtc: this tree's scripts/dtc/Makefile sets HOSTLDLIBS_dtc, but its
             # scripts/Makefile.host only reads HOSTLOADLIBES_*, so dtc fails to link whenever
             # libyaml-dev (yaml.h) is installed. Passing it explicitly fixes that.
@@ -343,6 +344,14 @@ jobs:
         run: |
           set -o pipefail
           $KMAKE 2>&1 | tee build.log
+
+      - name: Show real errors (only on failure)
+        if: failure()
+        run: |
+          echo "=== first errors in build.log ==="
+          grep -n -E "error:|Error [0-9]|undefined reference|No hooks|fatal|\*\*\*" build.log | head -40 || true
+          echo "=== 15 lines before the first make error ==="
+          n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* " build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
 
       - name: Collect output
         run: |
