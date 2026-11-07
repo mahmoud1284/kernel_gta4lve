@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       sukisu_ref:
-        description: "SukiSU-Ultra commit/tag/branch. Default = main"
+                description: "SukiSU-Ultra commit/tag/branch. Default = builtin"
         required: true
-        default: "main"
+        default: "builtin"
+
       sublevel:
         description: "Override SUBLEVEL in Makefile (e.g. 186 -> 4.14.186). Empty = keep source value"
         required: false
