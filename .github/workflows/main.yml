@@ -1,41 +1,187 @@
-name: Build gta4lve Kernel (via Kernel-Action)
+name: Build gta4lve + KernelSU-Next
 
 on:
   workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU-Next branch / tag / commit (legacy = non-GKI 4.x kernels)"
+        required: true
+        default: "legacy"
+      sublevel:
+        description: "Override SUBLEVEL in Makefile (version string only, e.g. 186 -> 4.14.186). Empty = keep source value"
+        required: false
+        default: "186"
+      force_module:
+        description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
+        type: boolean
+        default: true
+
+env:
+  DEFCONFIG: gta4lve_eur_open_defconfig
 
 jobs:
-  build-kernel:
-    name: Build Kernel
+  build:
+    name: Build kernel (KernelSU-Next, manual hooks)
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
     steps:
-      - name: Build
-        uses: vmos0/Kernel-Action@main
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
         with:
-          # ⚠️ لو الـ repo بتاعك Private، لازم تحط توكن جوه الرابط زي كده (بعد ما تضيف السيكريت KERNEL_TOKEN):
-          # kernel-url: https://${{ secrets.KERNEL_TOKEN }}@github.com/mahmoud1284/kernel_gta4lve
-          # لو الـ repo Public سيبه زي ما هو تحت:
-          kernel-url: https://github.com/mahmoud1284/kernel_gta4lve
-          kernel-branch: main   # ⚠️ غيّر لاسم الفرع الصحيح لو مختلف
-          config: gta4lve_eur_open_defconfig
-          arch: arm64
+          fetch-depth: 1
 
-          # التولچينز - proton-clang للـ Clang، + aosp-gcc عشان يوفر متغير CROSS_COMPILE
-          # (الـ Action محتاجة aosp-gcc مفعّل عشان تحدد الـ cross-compiler حتى مع كلانج خارجي)
-          other-clang-url: https://github.com/kdrag0n/proton-clang
-          other-clang-branch: master
-          aosp-gcc: true
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential curl git zip unzip xz-utils lz4 cpio \
+            python3 device-tree-compiler ca-certificates libyaml-dev
 
-          # KernelSU الرسمي (مسار مدمج ومُختبر جوه الـ Action)
-          # لاحظ: rifsxd/KernelSU-Next اتحوّل لأرشيف وبقى غير موثوق كرابط مباشر،
-          # فبنستخدم الرسمي الأول لحد ما نتأكد إن الباقي شغال، وبعدين نرجع نجرب فورك تاني لو حبيت
-          ksu: true
+      - name: Download toolchains (AOSP clang r383902b + GCC 4.9)
+        run: |
+          set -e
+          mkdir -p "$HOME/tc/clang" "$HOME/tc/gcc64"
 
-          # المميزات الإضافية من قائمتك الأصلية
-          rekernel: true      # Re-Kernel
-          bbg: true           # BaseBandGuard (ده على الأغلب المقصود بـ "BBG")
-          kprobes: true       # مطلوب لـ KPM / kprobe hooks
+          # --- GCC 4.9 (CROSS_COMPILE, same as build_kernel.sh) ---
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            "$HOME/tc/gcc64"
 
-          # تعبئة كيرنل نهائي (Image.gz / AnyKernel3)
-          anykernel3: true
+          # --- AOSP clang r383902b (same family as build_kernel.sh: clang-r383902) ---
+          got=0
+          for ref in android11-release android11-qpr1-release android11-qpr2-release android11-qpr3-release android12-release mirror-goog-main-llvm-toolchain-source; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${ref}/clang-r383902b.tar.gz"
+            echo "trying $url"
+            if curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/clang.tgz" \
+               && tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$HOME/tc/clang" \
+               && [ -x "$HOME/tc/clang/bin/clang" ]; then
+              got=1
+              echo "clang from branch: $ref"
+              break
+            fi
+            rm -rf "$HOME/tc/clang"/* || true
+          done
 
-          release: false      # سيبها false أول مرة لحد ما تتأكد إن البيلد بينجح
+          # --- fallback: Proton clang (newer, usually fine for 4.14) ---
+          if [ "$got" != "1" ]; then
+            echo "::warning::AOSP clang r383902b not downloadable, falling back to Proton clang"
+            rm -rf "$HOME/tc/clang"
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "$HOME/tc/clang"
+          fi
+
+          "$HOME/tc/clang/bin/clang" --version | head -1
+          echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate KernelSU-Next
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: |
+          set -e
+          # setup.sh clones KernelSU-Next into ./KernelSU-Next, checks out $KSU_REF,
+          # symlinks drivers/kernelsu and wires drivers/Makefile + drivers/Kconfig.
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" \
+            | bash -s "${KSU_REF}"
+          test -L drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile
+          grep -q "kernelsu/Kconfig" drivers/Kconfig
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) ($(git -C KernelSU-Next rev-parse --abbrev-ref HEAD))"
+
+      - name: Apply KernelSU manual hooks
+        run: python3 -I .github/scripts/ksu_manual_hooks.py .
+
+      - name: Override kernel version string (optional)
+        if: ${{ inputs.sublevel != '' }}
+        env:
+          SUBLEVEL_NEW: ${{ inputs.sublevel }}
+        run: |
+          set -e
+          echo "Before: $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_NEW}/" Makefile
+          echo "After:  $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
+
+      - name: Configure
+        env:
+          FORCE_MODULE: ${{ inputs.force_module }}
+        run: |
+          set -e
+          export BSP_BUILD_FAMILY=qogirl6
+          export BSP_BUILD_ANDROID_OS=y
+          export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="$PWD/tools/mkdtimg/ufdt_verify_overlay_host"
+
+          {
+            echo "BSP_BUILD_FAMILY=qogirl6"
+            echo "BSP_BUILD_ANDROID_OS=y"
+            echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT"
+            echo "DTC_OVERLAY_VTS_EXT=$DTC_OVERLAY_VTS_EXT"
+            # HOSTLOADLIBES_dtc: this tree's scripts/dtc/Makefile sets HOSTLDLIBS_dtc, but its
+            # scripts/Makefile.host only reads HOSTLOADLIBES_*, so dtc fails to link whenever
+            # libyaml-dev (yaml.h) is installed. Passing it explicitly fixes that.
+            echo "KMAKE=make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+          } >> "$GITHUB_ENV"
+
+          KMAKE="make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+
+          $KMAKE "$DEFCONFIG"
+
+          # KernelSU-Next (non-GKI): KPROBES stays OFF in this defconfig, so Kconfig
+          # auto-selects CONFIG_KSU_MANUAL_HOOK (default y if !KPROBES).
+          scripts/config --file out/.config -e KSU
+          if [ "$FORCE_MODULE" = "true" ]; then
+            scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
+          fi
+          $KMAKE olddefconfig
+
+          echo "---- resulting config ----"
+          grep -E '^(# )?CONFIG_(KSU|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG|OVERLAY_FS)[ =]' out/.config || true
+
+          # fail early instead of building a kernel without root support
+          grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config
+          if [ "$FORCE_MODULE" = "true" ]; then
+            grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
+          fi
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          $KMAKE 2>&1 | tee build.log
+
+      - name: Collect output
+        run: |
+          set -e
+          test -f out/arch/arm64/boot/Image
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image dist/Image
+          echo "Kernel release: $(cat out/include/config/kernel.release)"
+          echo "KSU_REL=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp dist/Image ak3/Image
+          # generic properties: no device-name check (codename not verified), boot partition
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + KernelSU-Next/' ak3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
+          (cd ak3 && zip -r9 "../dist/gta4lve-KSUNext-${KSU_REL}.zip" . -x '*.git*')
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4lve-kernelsu-next
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
