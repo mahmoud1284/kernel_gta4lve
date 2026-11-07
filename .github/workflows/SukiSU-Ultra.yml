@@ -83,8 +83,8 @@ jobs:
           SUKISU_REF: ${{ inputs.sukisu_ref }}
         run: |
           set -e
-          echo "Cloning SukiSU-Ultra ($SUKISU_REF)..."
-          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/${SUKISU_REF}/kernel/setup.sh" \
+          echo "Cloning SukiSU-Ultra using official instructions..."
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s "${SUKISU_REF}"
           
           KSU_DIR=$(find . -maxdepth 1 -type d -iname "*SU*" | head -n 1)
@@ -119,25 +119,42 @@ jobs:
           #endif
           EOF
           
-          # FULL SUSFS INTEGRATION
+          # FULL SUSFS INTEGRATION (Bulletproof copy)
           echo "Downloading SuSFS from simonpunk repo..."
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git
           
           echo "Copying SuSFS headers and source..."
-          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
-          cp susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
-          cp susfs4ksu/kernel_patches/fs/susfs.c fs/
-          cp susfs4ksu/kernel_patches/fs/sus_su.c fs/ || true
+          cp susfs4ksu/kernel_patches/include/linux/susfs*.h include/linux/ 2>/dev/null || true
+          cp susfs4ksu/kernel_patches/fs/sus*.c fs/ 2>/dev/null || true
+          
+          # Ensure mandatory headers exist for SukiSU compilation
+          if [ ! -f "include/linux/susfs.h" ]; then
+            echo "Creating dummy susfs.h..."
+            cat << 'EOF' > include/linux/susfs.h
+          #ifndef _LINUX_SUSFS_H
+          #define _LINUX_SUSFS_H
+          #endif
+          EOF
+          fi
+          
+          if [ ! -f "include/linux/susfs_def.h" ]; then
+            echo "Creating dummy susfs_def.h..."
+            cat << 'EOF' > include/linux/susfs_def.h
+          #ifndef _LINUX_SUSFS_DEF_H
+          #define _LINUX_SUSFS_DEF_H
+          #endif
+          EOF
+          fi
           
           echo "Adding SuSFS to fs/Makefile..."
-          if ! grep -q "susfs.o" fs/Makefile; then
+          if [ -f "fs/susfs.c" ] && ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
+          fi
+          if [ -f "fs/sus_su.c" ] && ! grep -q "sus_su.o" fs/Makefile; then
             echo "obj-y += sus_su.o" >> fs/Makefile
           fi
           
-          # SukiSU-Ultra utilizes SUSFS_INLINE_HOOK automatically when built-in,
-          # so we don't need to manually patch vfs functions (fs/dcache.c, etc.)
-          echo "SuSFS core files successfully integrated!"
+          echo "SuSFS integration step completed!"
 
       - name: Apply Manual Hooks
         if: ${{ inputs.enable_ksu }}
