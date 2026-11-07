@@ -93,6 +93,17 @@ jobs:
           grep -q "kernelsu/Kconfig" drivers/Kconfig
           echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) ($(git -C KernelSU-Next rev-parse --abbrev-ref HEAD))"
 
+          # IMPORTANT (boot fix): KernelSU-Next's Kbuild adds `atomic_t filter_count;` to
+          # struct seccomp in include/linux/seccomp.h. That changes struct task_struct, which
+          # changes the modversions CRC of most exported kernel symbols (commit_creds,
+          # put_task_struct, ...), so the device's stock vendor .ko modules refuse to load and
+          # the tablet hangs on the Samsung logo. On 4.14 that field is never used
+          # (app_profile.c only uses it for kernels >= 5.9), so drop the patch.
+          sed -i '/^ifneq .*atomic_t filter_count;/,/^endif/d' KernelSU-Next/kernel/Kbuild
+          if grep -q "filter_count" KernelSU-Next/kernel/Kbuild; then
+            echo "::error::seccomp filter_count patch still present in KernelSU-Next Kbuild"; exit 1
+          fi
+
       - name: Apply KernelSU manual hooks
         if: ${{ inputs.enable_ksu }}
         run: |
@@ -367,6 +378,12 @@ jobs:
       - name: Collect output
         run: |
           set -e
+          # the build must not have changed struct seccomp (would break stock vendor modules)
+          if ! git diff --quiet -- include/linux/seccomp.h; then
+            echo "::error::include/linux/seccomp.h was modified during the build (struct layout changed)"
+            git diff -- include/linux/seccomp.h
+            exit 1
+          fi
           test -f out/arch/arm64/boot/Image
           mkdir -p dist
           cp out/arch/arm64/boot/Image dist/Image
