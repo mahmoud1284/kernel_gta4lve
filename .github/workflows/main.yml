@@ -15,6 +15,10 @@ on:
         description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
         type: boolean
         default: true
+      enable_ksu:
+        description: "Integrate KernelSU-Next. Turn OFF to build a plain baseline kernel (boot test)"
+        type: boolean
+        default: true
 
 env:
   DEFCONFIG: gta4lve_eur_open_defconfig
@@ -75,6 +79,7 @@ jobs:
           echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
 
       - name: Integrate KernelSU-Next
+        if: ${{ inputs.enable_ksu }}
         env:
           KSU_REF: ${{ inputs.ksu_ref }}
         run: |
@@ -89,6 +94,7 @@ jobs:
           echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) ($(git -C KernelSU-Next rev-parse --abbrev-ref HEAD))"
 
       - name: Apply KernelSU manual hooks
+        if: ${{ inputs.enable_ksu }}
         run: |
           cat > "$RUNNER_TEMP/ksu_manual_hooks.py" <<'PYEOF'
           #!/usr/bin/env python3
@@ -299,6 +305,7 @@ jobs:
       - name: Configure
         env:
           FORCE_MODULE: ${{ inputs.force_module }}
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
         run: |
           set -e
           export BSP_BUILD_FAMILY=qogirl6
@@ -324,7 +331,9 @@ jobs:
 
           # KernelSU-Next (non-GKI): KPROBES stays OFF in this defconfig, so Kconfig
           # auto-selects CONFIG_KSU_MANUAL_HOOK (default y if !KPROBES).
-          scripts/config --file out/.config -e KSU
+          if [ "$ENABLE_KSU" = "true" ]; then
+            scripts/config --file out/.config -e KSU
+          fi
           if [ "$FORCE_MODULE" = "true" ]; then
             scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
           fi
@@ -334,8 +343,10 @@ jobs:
           grep -E '^(# )?CONFIG_(KSU|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG|OVERLAY_FS)[ =]' out/.config || true
 
           # fail early instead of building a kernel without root support
-          grep -q '^CONFIG_KSU=y' out/.config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config
+          if [ "$ENABLE_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config
+            grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config
+          fi
           if [ "$FORCE_MODULE" = "true" ]; then
             grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
           fi
