@@ -89,7 +89,202 @@ jobs:
           echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) ($(git -C KernelSU-Next rev-parse --abbrev-ref HEAD))"
 
       - name: Apply KernelSU manual hooks
-        run: python3 -I .github/scripts/ksu_manual_hooks.py .
+        run: |
+          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Apply KernelSU-Next *manual hooks* to a Linux 4.14 arm64 kernel tree.
+
+          Usage:  python3 ksu_manual_hooks.py <kernel-root>
+
+          - Idempotent: running it twice changes nothing the second time.
+          - Strict: if an anchor is not found (source drifted), it exits with an error
+            instead of silently producing a kernel without a hook.
+          - Every hook call is wrapped in `#ifdef CONFIG_KSU`, so a build with
+            CONFIG_KSU unset behaves exactly like the stock kernel.
+
+          Hook names/signatures match the `legacy` branch of KernelSU-Next
+          (kernel/core/init.c, kernel/feature/sucompat.c, kernel/runtime/ksud_integration.c,
+          kernel/supercall/supercall.c).
+          """
+          import os
+          import sys
+
+          HEADER_PATH = "include/linux/ksu_hooks.h"
+          HEADER = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_KSU_HOOKS_H
+          #define _LINUX_KSU_HOOKS_H
+
+          #include <linux/types.h>
+          #include <linux/compiler.h>
+
+          struct filename;
+          struct file;
+          struct stat;
+
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          			       void *argv, void *envp, int *flags);
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          				int *mode, int *__unused_flags);
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+          			   int *flags);
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+          			       size_t *count_ptr, loff_t **pos);
+          extern void ksu_handle_newfstat_ret(unsigned int *fd,
+          				    struct stat __user **statbuf_ptr);
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+          				 void __user **arg);
+          extern int ksu_handle_input_handle_event(unsigned int *type,
+          					 unsigned int *code, int *value);
+          #endif /* CONFIG_KSU */
+
+          #endif /* _LINUX_KSU_HOOKS_H */
+          """
+
+          INCLUDE_LINE = "#include <linux/ksu_hooks.h>\n"
+
+          # (file, function signature, anchor, mode, hook call)
+          #   mode "before": insert the hook right before `anchor`
+          #   mode "after" : insert the hook right after `anchor`
+          HOOKS = [
+              ("fs/exec.c",
+               "static int do_execveat_common(int fd, struct filename *filename,",
+               "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n",
+               "after",
+               "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
+
+              ("fs/open.c",
+               "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+               "\tif (mode & ~S_IRWXO)",
+               "before",
+               "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+               "\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+               "before",
+               "ksu_handle_stat(&dfd, &filename, &flag);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)",
+               "\treturn error;",
+               "before",
+               "ksu_handle_newfstat_ret(&fd, &statbuf);"),
+
+              ("fs/read_write.c",
+               "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)",
+               "\tif (!(file->f_mode & FMODE_READ))",
+               "before",
+               "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
+
+              ("kernel/reboot.c",
+               "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+               "\t/* We only trust the superuser with rebooting the system. */",
+               "before",
+               "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
+
+              ("drivers/input/input.c",
+               "void input_event(struct input_dev *dev,",
+               "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {",
+               "before",
+               "ksu_handle_input_handle_event(&type, &code, &value);"),
+          ]
+
+
+          def die(msg):
+              print("ERROR: " + msg, file=sys.stderr)
+              sys.exit(1)
+
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def write(path, text):
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(text)
+
+
+          def ensure_include(root, rel):
+              path = os.path.join(root, rel)
+              text = read(path)
+              if INCLUDE_LINE in text:
+                  return False
+              idx = text.find("\n#include ")
+              if idx < 0:
+                  die("%s: no #include line found" % rel)
+              idx += 1
+              eol = text.find("\n", idx) + 1
+              write(path, text[:eol] + INCLUDE_LINE + text[eol:])
+              return True
+
+
+          def apply_hook(root, rel, func_sig, anchor, mode, call):
+              path = os.path.join(root, rel)
+              text = read(path)
+
+              if text.count(func_sig) != 1:
+                  die("%s: function signature found %d times (expected 1):\n  %s"
+                      % (rel, text.count(func_sig), func_sig))
+              start = text.index(func_sig)
+              end = text.find("\n}\n", start)
+              if end < 0:
+                  die("%s: end of function not found: %s" % (rel, func_sig))
+
+              body = text[start:end]
+              if call in body:
+                  return False  # already patched
+
+              a = text.find(anchor, start)
+              if a < 0 or a > end:
+                  die("%s: anchor not found inside function:\n  %s\n  anchor: %r"
+                      % (rel, func_sig, anchor))
+
+              block = "#ifdef CONFIG_KSU\n\t%s\n#endif\n" % call
+              if mode == "before":
+                  pos = a
+                  new = text[:pos] + block + text[pos:]
+              else:
+                  pos = a + len(anchor)
+                  new = text[:pos] + block + text[pos:]
+              write(path, new)
+              return True
+
+
+          def main():
+              if len(sys.argv) != 2:
+                  die("usage: ksu_manual_hooks.py <kernel-root>")
+              root = os.path.abspath(sys.argv[1])
+              if not os.path.isfile(os.path.join(root, "Makefile")):
+                  die("%s does not look like a kernel tree" % root)
+
+              hdr = os.path.join(root, HEADER_PATH)
+              if not os.path.isfile(hdr) or read(hdr) != HEADER:
+                  write(hdr, HEADER)
+                  print("[+] wrote " + HEADER_PATH)
+              else:
+                  print("[=] " + HEADER_PATH + " already present")
+
+              for rel in sorted({h[0] for h in HOOKS}):
+                  if ensure_include(root, rel):
+                      print("[+] %s: added #include <linux/ksu_hooks.h>" % rel)
+
+              for rel, func_sig, anchor, mode, call in HOOKS:
+                  name = call.split("(")[0]
+                  if apply_hook(root, rel, func_sig, anchor, mode, call):
+                      print("[+] %s: hooked %s" % (rel, name))
+                  else:
+                      print("[=] %s: %s already hooked" % (rel, name))
+
+              print("[+] done")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -I "$RUNNER_TEMP/ksu_manual_hooks.py" .
 
       - name: Override kernel version string (optional)
         if: ${{ inputs.sublevel != '' }}
