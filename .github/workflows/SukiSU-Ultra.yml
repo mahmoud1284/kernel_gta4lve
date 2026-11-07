@@ -1,1 +1,286 @@
+name: Build gta4lve + SukiSU-Ultra (Built-in KPM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sukisu_ref:
+        description: "SukiSU-Ultra commit/tag/branch. Default = main"
+        required: true
+        default: "main"
+      sublevel:
+        description: "Override SUBLEVEL in Makefile (e.g. 186 -> 4.14.186). Empty = keep source value"
+        required: false
+        default: "186"
+      force_module:
+        description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
+        type: boolean
+        default: true
+      enable_ksu:
+        description: "Integrate SukiSU-Ultra. Turn OFF to build a plain baseline kernel"
+        type: boolean
+        default: true
+
+env:
+  DEFCONFIG: gta4lve_eur_open_defconfig
+
+jobs:
+  build:
+    name: Build kernel (SukiSU-Ultra, KPM, manual hooks)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential curl git zip unzip xz-utils lz4 cpio \
+            python3 device-tree-compiler ca-certificates libyaml-dev
+
+      - name: Download toolchains (AOSP clang r383902b + GCC 4.9)
+        run: |
+          set -e
+          mkdir -p "$HOME/tc/clang" "$HOME/tc/gcc64"
+
+          # GCC 4.9
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            "$HOME/tc/gcc64"
+
+          # AOSP clang r383902b
+          got=0
+          for ref in android11-release android11-qpr1-release android11-qpr2-release android11-qpr3-release android12-release mirror-goog-main-llvm-toolchain-source; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${ref}/clang-r383902b.tar.gz"
+            echo "trying $url"
+            if curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/clang.tgz" \
+               && tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$HOME/tc/clang" \
+               && [ -x "$HOME/tc/clang/bin/clang" ]; then
+              got=1
+              echo "clang from branch: $ref"
+              break
+            fi
+            rm -rf "$HOME/tc/clang"/* || true
+          done
+
+          if [ "$got" != "1" ]; then
+            echo "::warning::AOSP clang r383902b not downloadable, falling back to Proton clang"
+            rm -rf "$HOME/tc/clang"
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "$HOME/tc/clang"
+          fi
+
+          "$HOME/tc/clang/bin/clang" --version | head -1
+          echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate SukiSU-Ultra & Backport set_memory.h
+        if: ${{ inputs.enable_ksu }}
+        env:
+          SUKISU_REF: ${{ inputs.sukisu_ref }}
+        run: |
+          set -e
+          echo "Cloning SukiSU-Ultra ($SUKISU_REF)..."
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/${SUKISU_REF}/kernel/setup.sh" \
+            | bash -s "${SUKISU_REF}"
+          
+          # Identify clone directory (usually KernelSU)
+          KSU_DIR=$(find . -maxdepth 1 -type d -iname "*SU*" | head -n 1)
+          echo "Found SukiSU directory at: $KSU_DIR"
+          
+          test -L drivers/kernelsu || test -L drivers/sukisu
+          
+          # Fix Samsung Logo bootloop (drop seccomp atomic_t filter_count patch)
+          if [ -f "$KSU_DIR/kernel/Kbuild" ]; then
+            echo "Dropping seccomp patch from $KSU_DIR/kernel/Kbuild to prevent CRC mismatch..."
+            sed -i '/^ifneq .*atomic_t filter_count;/,/^endif/d' "$KSU_DIR/kernel/Kbuild"
+            if grep -q "filter_count" "$KSU_DIR/kernel/Kbuild"; then
+              echo "::error::seccomp filter_count patch still present in Kbuild"; exit 1
+            fi
+          fi
+
+          # Backport set_memory.h for kernel 4.14 (Required by SukiSU KPM)
+          echo "Backporting set_memory.h from Linux 4.19..."
+          curl -LSs "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/set_memory.h?h=linux-4.19.y" -o include/linux/set_memory.h
+          echo "set_memory.h backport completed."
+
+      - name: Apply Manual Hooks
+        if: ${{ inputs.enable_ksu }}
+        run: |
+          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" <<'PYEOF'
+          import os
+          import sys
+
+          HEADER_PATH = "include/linux/ksu_hooks.h"
+          HEADER = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_KSU_HOOKS_H
+          #define _LINUX_KSU_HOOKS_H
+          #include <linux/types.h>
+          #include <linux/compiler.h>
+          struct filename;
+          struct file;
+          struct stat;
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
+          extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          #endif
+          #endif
+          """
+          INCLUDE_LINE = "#include <linux/ksu_hooks.h>
+"
+
+          HOOKS = [
+              ("fs/exec.c", "static int do_execveat_common(int fd, struct filename *filename,", "	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+", "after", "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
+              ("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)", "	if (mode & ~S_IRWXO)", "before", "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
+              ("fs/stat.c", "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,", "	error = vfs_fstatat(dfd, filename, &stat, flag);", "before", "ksu_handle_stat(&dfd, &filename, &flag);"),
+              ("fs/stat.c", "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)", "	return error;", "before", "ksu_handle_newfstat_ret(&fd, &statbuf);"),
+              ("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)", "	if (!(file->f_mode & FMODE_READ))", "before", "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
+              ("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,", "	/* We only trust the superuser with rebooting the system. */", "before", "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
+              ("drivers/input/input.c", "void input_event(struct input_dev *dev,", "	if (is_event_supported(type, dev->evbit, EV_MAX)) {", "before", "ksu_handle_input_handle_event(&type, &code, &value);"),
+          ]
+
+          def die(msg):
+              print("ERROR: " + msg, file=sys.stderr)
+              sys.exit(1)
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f: return f.read()
+
+          def write(path, text):
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(text)
+
+          def ensure_include(root, rel):
+              path = os.path.join(root, rel)
+              text = read(path)
+              if INCLUDE_LINE in text: return False
+              idx = text.find("
+#include ")
+              if idx < 0: die("%s: no #include line found" % rel)
+              idx += 1
+              eol = text.find("
+", idx) + 1
+              write(path, text[:eol] + INCLUDE_LINE + text[eol:])
+              return True
+
+          def apply_hook(root, rel, func_sig, anchor, mode, call):
+              path = os.path.join(root, rel)
+              text = read(path)
+              if text.count(func_sig) != 1: die("%s: function sig found %d times:
+  %s" % (rel, text.count(func_sig), func_sig))
+              start = text.index(func_sig)
+              end = text.find("
+}
+", start)
+              if end < 0: die("%s: end not found: %s" % (rel, func_sig))
+              body = text[start:end]
+              if call in body: return False
+              a = text.find(anchor, start)
+              if a < 0 or a > end: die("%s: anchor not found:
+  %s
+  anchor: %r" % (rel, func_sig, anchor))
+              block = "#ifdef CONFIG_KSU
+	%s
+#endif
+" % call
+              pos = a if mode == "before" else a + len(anchor)
+              write(path, text[:pos] + block + text[pos:])
+              return True
+
+          def main():
+              root = os.path.abspath(sys.argv[1])
+              hdr = os.path.join(root, HEADER_PATH)
+              if not os.path.isfile(hdr) or read(hdr) != HEADER: write(hdr, HEADER)
+              for rel in sorted({h[0] for h in HOOKS}): ensure_include(root, rel)
+              for rel, func_sig, anchor, mode, call in HOOKS: apply_hook(root, rel, func_sig, anchor, mode, call)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -I "$RUNNER_TEMP/ksu_manual_hooks.py" .
+
+      - name: Override kernel version string
+        if: ${{ inputs.sublevel != '' }}
+        env:
+          SUBLEVEL_NEW: ${{ inputs.sublevel }}
+        run: |
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_NEW}/" Makefile
+
+      - name: Configure
+        env:
+          FORCE_MODULE: ${{ inputs.force_module }}
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+        run: |
+          set -e
+          export BSP_BUILD_FAMILY=qogirl6
+          export BSP_BUILD_ANDROID_OS=y
+          export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+
+          echo "BSP_BUILD_FAMILY=qogirl6" >> "$GITHUB_ENV"
+          echo "BSP_BUILD_ANDROID_OS=y" >> "$GITHUB_ENV"
+          echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT" >> "$GITHUB_ENV"
+          echo "KMAKE=make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml" >> "$GITHUB_ENV"
+
+          KMAKE="make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+
+          $KMAKE "$DEFCONFIG"
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            scripts/config --file out/.config -e KSU -e KPM -e KALLSYMS -e KALLSYMS_ALL
+          fi
+          if [ "$FORCE_MODULE" = "true" ]; then
+            scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
+          fi
+          $KMAKE olddefconfig
+
+          # Check mandatory built-in configs
+          if [ "$ENABLE_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU=y is missing"; exit 1; }
+            grep -q '^CONFIG_KPM=y' out/.config || { echo "::error::CONFIG_KPM=y is missing. SukiSU-Ultra requires it built-in."; exit 1; }
+            grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config || { echo "::error::CONFIG_KALLSYMS_ALL=y is missing"; exit 1; }
+          fi
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          $KMAKE 2>&1 | tee build.log
+
+      - name: Collect output
+        run: |
+          set -e
+          if ! git diff --quiet -- include/linux/seccomp.h; then
+            echo "::error::include/linux/seccomp.h was modified (struct layout changed)"
+            exit 1
+          fi
+          test -f out/arch/arm64/boot/Image
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image dist/Image
+          echo "KSU_REL=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp dist/Image ak3/Image
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra/' ak3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-Ultra-${KSU_REL}.zip" . -x '*.git*')
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4lve-sukisu-ultra
+          path: dist/*
+          if-no-files-found: error
 
