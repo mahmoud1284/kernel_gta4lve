@@ -1,4 +1,4 @@
-name: Build gta4lve + SukiSU-Ultra (Built-in KPM)
+name: Build gta4lve + SukiSU-Ultra (Built-in KPM + SuSFS)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       enable_ksu:
-        description: "Integrate SukiSU-Ultra. Turn OFF to build a plain baseline kernel"
+        description: "Integrate SukiSU-Ultra & SuSFS. Turn OFF to build a plain baseline kernel"
         type: boolean
         default: true
 
@@ -25,7 +25,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra, KPM, manual hooks)
+    name: Build kernel (SukiSU-Ultra, KPM, SuSFS, manual hooks)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -77,7 +77,7 @@ jobs:
           "$HOME/tc/clang/bin/clang" --version | head -1
           echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Integrate SukiSU-Ultra & Backport headers
+      - name: Integrate SukiSU-Ultra & SuSFS
         if: ${{ inputs.enable_ksu }}
         env:
           SUKISU_REF: ${{ inputs.sukisu_ref }}
@@ -119,17 +119,25 @@ jobs:
           #endif
           EOF
           
-          # FIX for 'linux/susfs.h file not found' on Non-GKI
-          # SukiSU-Ultra builtin branch attempts to include linux/susfs.h unconditionally in kernel_includes.h
-          # We need to provide a dummy header so compilation succeeds when susfs is not actually integrated into the kernel source.
-          echo "Creating dummy susfs.h..."
-          cat << 'EOF' > include/linux/susfs.h
-          #ifndef _LINUX_SUSFS_H
-          #define _LINUX_SUSFS_H
-          /* Dummy header to satisfy SukiSU-Ultra compilation when SuSFS is not integrated */
-          #endif
-          EOF
-          echo "Dummy susfs.h created."
+          # FULL SUSFS INTEGRATION
+          echo "Downloading SuSFS from simonpunk repo..."
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git
+          
+          echo "Copying SuSFS headers and source..."
+          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+          cp susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp susfs4ksu/kernel_patches/fs/sus_su.c fs/ || true
+          
+          echo "Adding SuSFS to fs/Makefile..."
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "obj-y += susfs.o" >> fs/Makefile
+            echo "obj-y += sus_su.o" >> fs/Makefile
+          fi
+          
+          # SukiSU-Ultra utilizes SUSFS_INLINE_HOOK automatically when built-in,
+          # so we don't need to manually patch vfs functions (fs/dcache.c, etc.)
+          echo "SuSFS core files successfully integrated!"
 
       - name: Apply Manual Hooks
         if: ${{ inputs.enable_ksu }}
@@ -248,7 +256,7 @@ jobs:
           $KMAKE "$DEFCONFIG"
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            scripts/config --file out/.config -e KSU -e KPM -e KALLSYMS -e KALLSYMS_ALL
+            scripts/config --file out/.config -e KSU -e KPM -e KALLSYMS -e KALLSYMS_ALL -e KSU_SUSFS -e KSU_SUSFS_SUS_SU -e KSU_SUSFS_INLINE_HOOK
           fi
           if [ "$FORCE_MODULE" = "true" ]; then
             scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
@@ -294,7 +302,7 @@ jobs:
           rm -rf ak3/.git ak3/.github ak3/README.md
           cp dist/Image ak3/Image
           sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SuSFS/' ak3/anykernel.sh
           sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
           (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-Ultra-${KSU_REL}.zip" . -x '*.git*')
 
