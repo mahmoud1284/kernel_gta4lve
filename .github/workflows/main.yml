@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "KernelSU-Next branch / tag / commit (legacy = non-GKI 4.x kernels)"
+        description: "KernelSU-Next commit/tag/branch. Default = last 'legacy' commit with UAPI 5 (matches manager v3.4.2). 'legacy' = newest, UAPI 6 (needs a newer manager)"
         required: true
-        default: "legacy"
+        default: "465490a26667ba4cf00b3be975a7e28e53978829"
       sublevel:
         description: "Override SUBLEVEL in Makefile (version string only, e.g. 186 -> 4.14.186). Empty = keep source value"
         required: false
@@ -92,6 +92,9 @@ jobs:
           grep -q "kernelsu" drivers/Makefile
           grep -q "kernelsu/Kconfig" drivers/Kconfig
           echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) ($(git -C KernelSU-Next rev-parse --abbrev-ref HEAD))"
+          # The manager app warns "manager version too low" when its UAPI < the kernel's UAPI.
+          # Manager v3.4.2 = UAPI 5. Make the value visible in the log.
+          echo "KernelSU-Next UAPI: $(grep -o 'UAPI_VERSION[ =]*[0-9]*' KernelSU-Next/uapi/supercall.h | head -1)"
 
           # IMPORTANT (boot fix): KernelSU-Next's Kbuild adds `atomic_t filter_count;` to
           # struct seccomp in include/linux/seccomp.h. That changes struct task_struct, which
@@ -360,6 +363,13 @@ jobs:
           fi
           if [ "$FORCE_MODULE" = "true" ]; then
             grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
+          fi
+
+          # KPM (KPatch-Next module) prerequisites: kallsyms with ALL symbols, and no built-in KPM
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
+          if grep -q '^CONFIG_KPM=y' out/.config; then
+            echo "::error::CONFIG_KPM=y is built in; KPatch-Next rejects such kernels"; exit 1
           fi
 
       - name: Build kernel
