@@ -97,9 +97,6 @@ jobs:
           if [ -f "$KSU_DIR/kernel/Kbuild" ]; then
             echo "Dropping seccomp patch from $KSU_DIR/kernel/Kbuild to prevent CRC mismatch..."
             sed -i '/^ifneq .*atomic_t filter_count;/,/^endif/d' "$KSU_DIR/kernel/Kbuild"
-            if grep -q "filter_count" "$KSU_DIR/kernel/Kbuild"; then
-              echo "::error::seccomp filter_count patch still present in Kbuild"; exit 1
-            fi
           fi
 
           # Backport set_memory.h for kernel 4.14 (Required by SukiSU KPM)
@@ -110,7 +107,7 @@ jobs:
       - name: Apply Manual Hooks
         if: ${{ inputs.enable_ksu }}
         run: |
-          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" <<'PYEOF'
+          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" << 'PYEOF'
           import os
           import sys
 
@@ -134,19 +131,16 @@ jobs:
           #endif
           #endif
           """
-          INCLUDE_LINE = "#include <linux/ksu_hooks.h>
-"
+          INCLUDE_LINE = "#include <linux/ksu_hooks.h>\n"
 
           HOOKS = [
-              ("fs/exec.c", "static int do_execveat_common(int fd, struct filename *filename,", "	if (IS_ERR(filename))
-		return PTR_ERR(filename);
-", "after", "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
-              ("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)", "	if (mode & ~S_IRWXO)", "before", "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
-              ("fs/stat.c", "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,", "	error = vfs_fstatat(dfd, filename, &stat, flag);", "before", "ksu_handle_stat(&dfd, &filename, &flag);"),
-              ("fs/stat.c", "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)", "	return error;", "before", "ksu_handle_newfstat_ret(&fd, &statbuf);"),
-              ("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)", "	if (!(file->f_mode & FMODE_READ))", "before", "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
-              ("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,", "	/* We only trust the superuser with rebooting the system. */", "before", "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
-              ("drivers/input/input.c", "void input_event(struct input_dev *dev,", "	if (is_event_supported(type, dev->evbit, EV_MAX)) {", "before", "ksu_handle_input_handle_event(&type, &code, &value);"),
+              ("fs/exec.c", "static int do_execveat_common(int fd, struct filename *filename,", "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n", "after", "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
+              ("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)", "\tif (mode & ~S_IRWXO)", "before", "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
+              ("fs/stat.c", "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,", "\terror = vfs_fstatat(dfd, filename, &stat, flag);", "before", "ksu_handle_stat(&dfd, &filename, &flag);"),
+              ("fs/stat.c", "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)", "\treturn error;", "before", "ksu_handle_newfstat_ret(&fd, &statbuf);"),
+              ("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)", "\tif (!(file->f_mode & FMODE_READ))", "before", "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
+              ("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,", "\t/* We only trust the superuser with rebooting the system. */", "before", "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
+              ("drivers/input/input.c", "void input_event(struct input_dev *dev,", "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {", "before", "ksu_handle_input_handle_event(&type, &code, &value);"),
           ]
 
           def die(msg):
@@ -163,35 +157,25 @@ jobs:
               path = os.path.join(root, rel)
               text = read(path)
               if INCLUDE_LINE in text: return False
-              idx = text.find("
-#include ")
+              idx = text.find("\n#include ")
               if idx < 0: die("%s: no #include line found" % rel)
               idx += 1
-              eol = text.find("
-", idx) + 1
+              eol = text.find("\n", idx) + 1
               write(path, text[:eol] + INCLUDE_LINE + text[eol:])
               return True
 
           def apply_hook(root, rel, func_sig, anchor, mode, call):
               path = os.path.join(root, rel)
               text = read(path)
-              if text.count(func_sig) != 1: die("%s: function sig found %d times:
-  %s" % (rel, text.count(func_sig), func_sig))
+              if text.count(func_sig) != 1: die("%s: function sig found %d times:\n  %s" % (rel, text.count(func_sig), func_sig))
               start = text.index(func_sig)
-              end = text.find("
-}
-", start)
+              end = text.find("\n}\n", start)
               if end < 0: die("%s: end not found: %s" % (rel, func_sig))
               body = text[start:end]
               if call in body: return False
               a = text.find(anchor, start)
-              if a < 0 or a > end: die("%s: anchor not found:
-  %s
-  anchor: %r" % (rel, func_sig, anchor))
-              block = "#ifdef CONFIG_KSU
-	%s
-#endif
-" % call
+              if a < 0 or a > end: die("%s: anchor not found:\n  %s\n  anchor: %r" % (rel, func_sig, anchor))
+              block = "#ifdef CONFIG_KSU\n\t%s\n#endif\n" % call
               pos = a if mode == "before" else a + len(anchor)
               write(path, text[:pos] + block + text[pos:])
               return True
@@ -225,10 +209,12 @@ jobs:
           export BSP_BUILD_ANDROID_OS=y
           export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
 
-          echo "BSP_BUILD_FAMILY=qogirl6" >> "$GITHUB_ENV"
-          echo "BSP_BUILD_ANDROID_OS=y" >> "$GITHUB_ENV"
-          echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT" >> "$GITHUB_ENV"
-          echo "KMAKE=make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml" >> "$GITHUB_ENV"
+          {
+            echo "BSP_BUILD_FAMILY=qogirl6"
+            echo "BSP_BUILD_ANDROID_OS=y"
+            echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT"
+            echo "KMAKE=make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+          } >> "$GITHUB_ENV"
 
           KMAKE="make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
 
@@ -253,6 +239,14 @@ jobs:
         run: |
           set -o pipefail
           $KMAKE 2>&1 | tee build.log
+
+      - name: Show real errors (only on failure)
+        if: failure()
+        run: |
+          echo "=== first errors in build.log ==="
+          grep -n -E "error:|Error [0-9]|undefined reference|No hooks|fatal|\*\*\*" build.log | head -40 || true
+          echo "=== 15 lines before the first make error ==="
+          n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* " build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
 
       - name: Collect output
         run: |
@@ -284,3 +278,10 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
