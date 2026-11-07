@@ -103,6 +103,29 @@ jobs:
           echo "Backporting set_memory.h from Linux 4.19..."
           curl -LSs "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/set_memory.h?h=linux-4.19.y" -o include/linux/set_memory.h
           echo "set_memory.h backport completed."
+          
+          # FIX for 'linux/static_call.h file not found' on 4.14
+          # The file kernel_includes.h in SukiSU includes static_call.h, which was introduced in 5.10.
+          # Create a dummy header so compilation doesn't fail.
+          echo "Creating dummy static_call.h..."
+          mkdir -p include/linux
+          cat << 'EOF' > include/linux/static_call.h
+          #ifndef _LINUX_STATIC_CALL_H
+          #define _LINUX_STATIC_CALL_H
+          
+          #include <linux/types.h>
+          
+          /* Dummy definitions for kernels < 5.10 to satisfy SukiSU compilation */
+          #define DECLARE_STATIC_CALL(name, func)
+          #define DEFINE_STATIC_CALL(name, func)
+          #define DEFINE_STATIC_CALL_NULL(name, typename)
+          #define static_call(name) (name)
+          #define static_call_cond(name) (name)
+          #define static_call_update(name, func) do {} while (0)
+          
+          #endif
+          EOF
+          echo "Dummy static_call.h created."
 
       - name: Apply Manual Hooks
         if: ${{ inputs.enable_ksu }}
