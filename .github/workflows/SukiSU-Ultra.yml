@@ -411,7 +411,8 @@ jobs:
              including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `can_umount` +
              `path_umount` 4.14 backport in `fs/namespace.c` (placed after `may_mount`),
              `susfs_starts_with`/`susfs_ends_with`, `susfs_start_sdcard_monitor_fn`, and
-             `susfs_set_current_proc_no_su`/`susfs_set_current_proc_umounted*` helpers.
+             `susfs_set_current_proc_no_su`/`susfs_set_current_proc_umounted*` helpers, without
+             duplicating `susfs_is_current_ksu_domain` (already defined in `drivers/kernelsu/`).
           3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
              `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
              variable declarations.
@@ -838,12 +839,6 @@ jobs:
               return 0;
           }
           EXPORT_SYMBOL(susfs_start_sdcard_monitor_fn);
-
-          bool susfs_is_current_ksu_domain(void)
-          {
-              return current_uid().val == 0;
-          }
-          EXPORT_SYMBOL(susfs_is_current_ksu_domain);
 
           static void susfs_mark_path_inode_bit(const char *pathname, unsigned long bit, uid_t i_uid, bool set_uid)
           {
