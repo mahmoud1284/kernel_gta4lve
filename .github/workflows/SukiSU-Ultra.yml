@@ -258,7 +258,7 @@ jobs:
           time_h = Path("KernelSU/kernel/preinit/runner/nolibc/time.h")
           s = time_h.read_text()
           marker = "#include <linux/time.h>\n"
-          compat = (marker
+          compat = marker + (
                     "\n/* Linux 4.14 UAPI has no __kernel_timespec type. */\n"
                     "#ifndef __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
                     "#define __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
