@@ -1,11 +1,8 @@
-name: Build gta4lve + SukiSU-Ultra + SuSFS + NoMount
+name: Build gta4lve + SukiSU-Ultra + SUSFS + NoMount
 
 # Separate from build-kernelsu-next.yml (that one is untouched).
 # SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
 # compat patch (.github/patches is NOT needed: the patch is embedded below).
-# SuSFS is integrated via an idempotent 4.14 port + inline VFS/proc/uname/cmdline/kallsyms
-# hook script that preserves core struct layouts (include/linux/sched.h, mount.h, seccomp.h)
-# so stock vendor .ko module CRCs are not broken.
 
 on:
   workflow_dispatch:
@@ -27,13 +24,9 @@ on:
         type: boolean
         default: true
       enable_susfs:
-        description: "Integrate SuSFS (in-kernel path/mount/kstat/uname/cmdline/maps hiding for SukiSU-Ultra)"
+        description: "SUSFS v2.3.0 (ported to this 4.14 tree, replaces the plain manual hooks). Turn OFF to get the previous SukiSU-only build"
         type: boolean
         default: true
-      susfs_branch:
-        description: "simonpunk/susfs4ksu reference branch (default: kernel-4.14)"
-        required: false
-        default: "kernel-4.14"
       enable_nomount:
         description: "Integrate NoMount (maxsteeel/nomount, in-kernel VFS redirection). Install the NoMount metamodule afterwards"
         type: boolean
@@ -48,7 +41,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra + SuSFS, manual hooks)
+    name: Build kernel (SukiSU-Ultra, manual hooks)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -180,6 +173,19 @@ jobs:
            
                if (!(current->flags & PF_KTHREAD)) {
                    cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+          diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
+          index 4948cdfa..11d2b827 100644
+          --- a/kernel/sulog/event.c
+          +++ b/kernel/sulog/event.c
+          @@ -140,7 +140,7 @@ static __u32 ksu_sulog_flatten_argv(struct user_arg_ptr *argv_user, char *dst, _
+                       return ksu_sulog_copy_empty_string(dst);
+           
+                   copied =
+          -            strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
+          +            ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
+                   if (copied <= 0)
+                       return ksu_sulog_copy_empty_string(dst);
+           
           diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
           index 9a94512b..8ea2eb5e 100644
           --- a/kernel/supercall/dispatch.c
@@ -208,8 +214,489 @@ jobs:
           # Don't let warnings in the SukiSU driver fail the build.
           printf '\nccflags-y += -Wno-error\n' >> KernelSU/kernel/Makefile
 
-      - name: Apply SukiSU manual hooks
-        if: ${{ inputs.enable_ksu }}
+      - name: Apply SUSFS v2.3.0 kernel patch (ported to 4.14)
+        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
+        run: |
+          set -e
+          # SUSFS v2.3.0 (core: fs/susfs.c + headers, from wxx9248/susfs4ksu `kernel-4.9-v2`)
+          # hand-ported to this Samsung 4.14 tree. It also carries the SukiSU hook calls
+          # (execve/faccessat/stat/read/reboot/setresuid/input), so the plain manual-hooks
+          # step is skipped. It does NOT touch struct seccomp / struct vfsmount / task_struct.
+          # (gzip+base64 only to keep this file small; the .patch is delivered next to it)
+          base64 -d > "$RUNNER_TEMP/susfs.patch.gz" <<'B64EOF'
+          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
+          Y4APAgA=
+          B64EOF
+          gunzip -f "$RUNNER_TEMP/susfs.patch.gz"
+          echo "40f2802790bd5f863d87ce6a0e27d962e87f51718323199c4abd2e6574ed84b4  $RUNNER_TEMP/susfs.patch" | sha256sum -c -
+          patch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
+          test -f fs/susfs.c && test -f include/linux/susfs.h
+          grep -q "susfs.o" fs/Makefile
+          echo "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
+
+      - name: Apply SukiSU manual hooks (only when SUSFS is off)
+        if: ${{ inputs.enable_ksu && !inputs.enable_susfs }}
         run: |
           cat > "$RUNNER_TEMP/ksu_manual_hooks_suki.py" <<'PYEOF'
           #!/usr/bin/env python3
@@ -223,7 +710,7 @@ jobs:
             silently producing a kernel without a hook.
           - Every call is wrapped in `#ifdef CONFIG_KSU`, so CONFIG_KSU=n gives the stock kernel.
           - Setuid / umount handling is done by SukiSU through an LSM hook, so no kernel patch is
-            needed for those.
+            needed for those. SUSFS is NOT supported here (it needs a large kernel patch set).
           """
           import os
           import re
@@ -387,1411 +874,6 @@ jobs:
           PYEOF
           python3 -I "$RUNNER_TEMP/ksu_manual_hooks_suki.py" .
 
-      - name: Integrate SuSFS (4.14 port + inline hooks)
-        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
-        env:
-          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
-        run: |
-          set -e
-          # Clone upstream simonpunk/susfs4ksu for reference headers/patches if reachable
-          git clone --depth=1 -b "${SUSFS_BRANCH}" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu" || \
-            git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu" || true
-
-          cat > "$RUNNER_TEMP/integrate_susfs_suki_414.py" <<'PYEOF'
-          #!/usr/bin/env python3
-          """
-          Integrate SuSFS into a Linux 4.14 arm64 kernel tree for SukiSU-Ultra (`builtin` branch).
-
-          Design goals for mahmoud1284/kernel_gta4lve:
-          1. KABI / Module CRC preservation: NEVER modifies `include/linux/sched.h`,
-             `include/linux/mount.h`, or `include/linux/seccomp.h`. Per-inode state uses
-             high bits in `inode->i_mapping->flags`, and per-task state uses high bits in
-             `current_thread_info()->flags` (`TIF_PROC_UMOUNTED`, `TIF_PROC_NO_SU`, etc.).
-          2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
-             including automatic synthesis of any `extern ... susfs_*` symbols referenced by
-             `KernelSU/kernel/` (such as `susfs_extra_works` and `susfs_add_sus_avd_allowed_by_type`).
-          3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
-             `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
-             variable declarations.
-          """
-          import glob
-          import os
-          import re
-          import sys
-          import textwrap
-
-          SUSFS_DEF_H = textwrap.dedent(r"""\
-          /* SPDX-License-Identifier: GPL-2.0 */
-          #ifndef KSU_SUSFS_DEF_H
-          #define KSU_SUSFS_DEF_H
-
-          #include <linux/bits.h>
-          #include <linux/string.h>
-          #include <linux/thread_info.h>
-
-          #define SUSFS_VERSION "v2.0.0"
-          #define SUSFS_VARIANT "NON-GKI"
-          #define SUSFS_MAGIC 0xFAFAFAFA
-
-          /* Supercall command numbers */
-          #define CMD_SUSFS_ADD_SUS_PATH 0x55550
-          #define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH 0x55551
-          #define CMD_SUSFS_SET_SDCARD_ROOT_PATH 0x55552
-          #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55553
-          #define CMD_SUSFS_ADD_SUS_MOUNT 0x55560
-          #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
-          #define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562
-          #define CMD_SUSFS_ADD_SUS_KSTAT 0x55570
-          #define CMD_SUSFS_UPDATE_SUS_KSTAT 0x55571
-          #define CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY 0x55572
-          #define CMD_SUSFS_ADD_TRY_UMOUNT 0x55580
-          #define CMD_SUSFS_SET_UNAME 0x55590
-          #define CMD_SUSFS_ENABLE_LOG 0x555a0
-          #define CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG 0x555b0
-          #define CMD_SUSFS_ADD_OPEN_REDIRECT 0x555c0
-          #define CMD_SUSFS_SHOW_VERSION 0x555e1
-          #define CMD_SUSFS_SHOW_ENABLED_FEATURES 0x555e2
-          #define CMD_SUSFS_SHOW_VARIANT 0x555e3
-          #define CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE 0x555e4
-          #define CMD_SUSFS_IS_SUS_SU_READY 0x555f0
-          #define CMD_SUSFS_SUS_SU 0x60000
-          #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x60010
-          #define CMD_SUSFS_ADD_SUS_MAP 0x60020
-          #define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030
-
-          #define SUSFS_MAX_LEN_PATHNAME 256
-          #define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 4096
-
-          #define TRY_UMOUNT_DEFAULT 0
-          #define TRY_UMOUNT_DETACH 1
-
-          #define SUS_SU_DISABLED 0
-          #define SUS_SU_WITH_OVERLAY 1
-          #define SUS_SU_WITH_HOOKS 2
-
-          #define DEFAULT_SUS_MNT_ID 100000
-          #define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000
-          #define DEFAULT_SUS_MNT_GROUP_ID 1000
-
-          /*
-           * High bits in inode->i_mapping->flags (unsigned long on arm64).
-           * Kept in susfs_def.h so include/linux/fs.h and core structs need no layout changes.
-           */
-          #define AS_FLAGS_SUS_PATH 24
-          #define AS_FLAGS_SUS_MOUNT 25
-          #define AS_FLAGS_SUS_KSTAT 26
-          #define AS_FLAGS_OPEN_REDIRECT 27
-          #define AS_FLAGS_ANDROID_DATA_ROOT_PATH 28
-          #define AS_FLAGS_SDCARD_ROOT_PATH 29
-          #define AS_FLAGS_SUS_MAP 30
-
-          #define BIT_SUS_PATH BIT(AS_FLAGS_SUS_PATH)
-          #define BIT_SUS_MOUNT BIT(AS_FLAGS_SUS_MOUNT)
-          #define BIT_SUS_KSTAT BIT(AS_FLAGS_SUS_KSTAT)
-          #define BIT_OPEN_REDIRECT BIT(AS_FLAGS_OPEN_REDIRECT)
-          #define BIT_ANDROID_DATA_ROOT_PATH BIT(AS_FLAGS_ANDROID_DATA_ROOT_PATH)
-          #define BIT_SDCARD_ROOT_PATH BIT(AS_FLAGS_SDCARD_ROOT_PATH)
-          #define BIT_SUS_MAP BIT(AS_FLAGS_SUS_MAP)
-
-          /*
-           * High bits in current_thread_info()->flags (unsigned long on arm64, bits 0..26 used by kernel).
-           * Preserves struct task_struct layout in include/linux/sched.h.
-           */
-          #define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 29
-          #define TIF_PROC_UMOUNTED 30
-          #define TIF_PROC_NO_SU 31
-
-          #define ND_STATE_LOOKUP_LAST 32
-          #define ND_STATE_OPEN_LAST 64
-          #define ND_STATE_LAST_SDCARD_SUS_PATH 128
-          #define ND_FLAGS_LOOKUP_LAST 0x2000000
-
-          #define MAGIC_MOUNT_WORKDIR "/debug_ramdisk/workdir"
-          #define DATA_ADB_UMOUNT_FOR_ZYGOTE_SYSTEM_PROCESS "/data/adb/susfs_umount_for_zygote_system_process"
-          #define DATA_ADB_NO_AUTO_ADD_SUS_BIND_MOUNT "/data/adb/susfs_no_auto_add_sus_bind_mount"
-          #define DATA_ADB_NO_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT "/data/adb/susfs_no_auto_add_sus_ksu_default_mount"
-          #define DATA_ADB_NO_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT "/data/adb/susfs_no_auto_add_try_umount_for_bind_mount"
-
-          static inline bool susfs_starts_with(const char *str, const char *prefix)
-          {
-              return strncmp(str, prefix, strlen(prefix)) == 0;
-          }
-
-          static inline bool susfs_ends_with(const char *str, const char *suffix)
-          {
-              size_t str_len = strlen(str);
-              size_t suffix_len = strlen(suffix);
-              if (suffix_len > str_len)
-                  return false;
-              return strcmp(str + str_len - suffix_len, suffix) == 0;
-          }
-
-          static inline void susfs_set_current_proc_umounted(void)
-          {
-              set_ti_thread_flag(current_thread_info(), TIF_PROC_UMOUNTED);
-          }
-
-          static inline bool susfs_is_current_proc_umounted(void)
-          {
-              return test_ti_thread_flag(current_thread_info(), TIF_PROC_UMOUNTED);
-          }
-
-          static inline void susfs_set_current_proc_no_su(void)
-          {
-              set_ti_thread_flag(current_thread_info(), TIF_PROC_NO_SU);
-          }
-
-          static inline bool susfs_is_current_proc_no_su(void)
-          {
-              return test_ti_thread_flag(current_thread_info(), TIF_PROC_NO_SU);
-          }
-
-          static inline void susfs_set_current_proc_umounted_for_zygote_next(void)
-          {
-              set_ti_thread_flag(current_thread_info(), TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
-          }
-
-          static inline bool susfs_is_current_proc_umounted_for_zygote_next(void)
-          {
-              return test_ti_thread_flag(current_thread_info(), TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
-          }
-
-          static inline void susfs_clear_current_proc_umounted_for_zygote_next(void)
-          {
-              clear_ti_thread_flag(current_thread_info(), TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
-          }
-
-          static inline void susfs_set_current_proc_su_not_allowed(void)
-          {
-              set_ti_thread_flag(current_thread_info(), TIF_PROC_NO_SU);
-          }
-
-          static inline bool susfs_is_current_proc_su_not_allowed(void)
-          {
-              return test_ti_thread_flag(current_thread_info(), TIF_PROC_NO_SU);
-          }
-
-          static inline void susfs_set_current_non_root_user_app_proc(void)
-          {
-              set_ti_thread_flag(current_thread_info(), TIF_PROC_NO_SU);
-          }
-
-          #endif /* KSU_SUSFS_DEF_H */
-          """)
-
-          SUSFS_H = textwrap.dedent(r"""\
-          /* SPDX-License-Identifier: GPL-2.0 */
-          #ifndef KSU_SUSFS_H
-          #define KSU_SUSFS_H
-
-          #include <linux/version.h>
-          #include <linux/types.h>
-          #include <linux/utsname.h>
-          #include <linux/hashtable.h>
-          #include <linux/path.h>
-          #include <linux/fs.h>
-          #include <linux/sched.h>
-          #include <linux/cred.h>
-          #include <linux/uaccess.h>
-          #include <linux/susfs_def.h>
-
-          #define SUSFS_VERSION "v2.0.0"
-          #define SUSFS_VARIANT "NON-GKI"
-
-          /* Linux < 5.8 fallback for strncpy_from_user_nofault when SUSFS_INLINE_HOOK is active */
-          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-          static inline long susfs_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
-          {
-              return strncpy_from_user(dst, (const char __user *)unsafe_addr, count);
-          }
-          #ifndef strncpy_from_user_nofault
-          #define strncpy_from_user_nofault(dst, src, count) susfs_strncpy_from_user_nofault((dst), (src), (count))
-          #endif
-          #endif
-
-          #define SUSFS_LOGI(fmt, ...) \
-              do { if (susfs_is_log_enabled) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__); } while (0)
-          #define SUSFS_LOGE(fmt, ...) \
-              do { if (susfs_is_log_enabled) pr_err("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__); } while (0)
-
-          struct st_susfs_sus_path {
-              unsigned long                    target_ino;
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              unsigned int                     i_uid;
-              int                              err;
-          };
-
-          struct st_susfs_sus_path_list {
-              struct list_head                 list;
-              struct st_susfs_sus_path         info;
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              size_t                           path_len;
-          };
-
-          struct st_external_dir {
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              bool                             is_inited;
-              int                              cmd;
-              int                              err;
-          };
-
-          struct st_susfs_sus_mount {
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              unsigned long                    target_dev;
-              int                              err;
-          };
-
-          struct st_susfs_sus_mount_list {
-              struct list_head                 list;
-              struct st_susfs_sus_mount        info;
-          };
-
-          struct st_susfs_sus_kstat {
-              int                              is_statically;
-              unsigned long                    target_ino;
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              unsigned long                    spoofed_ino;
-              unsigned long                    spoofed_dev;
-              unsigned int                     spoofed_nlink;
-              long long                        spoofed_size;
-              long                             spoofed_atime_tv_sec;
-              long                             spoofed_mtime_tv_sec;
-              long                             spoofed_ctime_tv_sec;
-              long                             spoofed_atime_tv_nsec;
-              long                             spoofed_mtime_tv_nsec;
-              long                             spoofed_ctime_tv_nsec;
-              unsigned long                    spoofed_blksize;
-              unsigned long long               spoofed_blocks;
-              int                              err;
-          };
-
-          struct st_susfs_sus_kstat_hlist {
-              unsigned long                    target_ino;
-              struct st_susfs_sus_kstat        info;
-              struct hlist_node                node;
-          };
-
-          struct st_susfs_try_umount {
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              int                              mnt_mode;
-              int                              err;
-          };
-
-          struct st_susfs_try_umount_list {
-              struct list_head                 list;
-              struct st_susfs_try_umount       info;
-          };
-
-          struct st_susfs_uname {
-              char                             release[__NEW_UTS_LEN + 1];
-              char                             version[__NEW_UTS_LEN + 1];
-              int                              err;
-          };
-
-          struct st_susfs_open_redirect {
-              unsigned long                    target_ino;
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              char                             redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
-              int                              err;
-          };
-
-          struct st_susfs_open_redirect_hlist {
-              unsigned long                    target_ino;
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              char                             redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
-              struct hlist_node                node;
-          };
-
-          struct st_susfs_sus_map {
-              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
-              int                              err;
-          };
-
-          struct st_susfs_sus_su {
-              int                              mode;
-              int                              err;
-          };
-
-          struct st_susfs_priority_uid_filter {
-              char                             pkg_names[4096];
-              int                              err;
-          };
-
-          extern bool susfs_is_log_enabled;
-          extern bool susfs_hide_sus_mnts_for_non_su_procs;
-          extern bool susfs_is_avc_log_spoofing_enabled;
-
-          /* Core SuSFS APIs called by SukiSU-Ultra and kernel hooks */
-          void susfs_init(void);
-          int susfs_start_sdcard_monitor_fn(void);
-          int susfs_add_sus_path(void __user **user_info);
-          int susfs_add_sus_path_loop(void __user **user_info);
-          int susfs_set_i_state_on_external_dir(void __user **user_info);
-          int susfs_add_sus_mount(void __user **user_info);
-          int susfs_add_sus_kstat(void __user **user_info);
-          int susfs_update_sus_kstat(void __user **user_info);
-          int susfs_add_try_umount(void __user **user_info);
-          void susfs_try_umount(uid_t target_uid);
-          void susfs_try_umount_all(uid_t target_uid);
-          int susfs_set_uname(void __user **user_info);
-          int susfs_set_cmdline_or_bootconfig(void __user **user_info);
-          int susfs_add_open_redirect(void __user **user_info);
-          int susfs_add_sus_map(void __user **user_info);
-          int susfs_get_enabled_features(void __user **user_info);
-          int susfs_show_version(void __user **user_info);
-          int susfs_show_variant(void __user **user_info);
-          int susfs_enable_log(void __user **user_info);
-          int susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info);
-          int susfs_set_umount_for_zygote_iso_service(void __user **user_info);
-          int susfs_set_avc_log_spoofing(void __user **user_info);
-          int susfs_sus_su(void __user **user_info);
-          int susfs_show_sus_su_working_mode(void __user **user_info);
-          int susfs_is_sus_su_ready(void __user **user_info);
-
-          /* Priority UID filter APIs (SukiSU-Ultra builtin / SUSFS v2.3+) */
-          void susfs_parse_priority_app_strings(void);
-          int susfs_set_priority_uid_filter(void __user **user_info);
-          bool susfs_is_uid_priority_filtered(uid_t target_uid);
-
-          /* Helpers used by kernel VFS/proc/uname/cmdline hooks */
-          bool susfs_is_inode_sus_path(struct inode *inode);
-          bool susfs_is_dentry_sus_path(struct dentry *dentry);
-          bool susfs_is_name_sus_path(struct inode *dir, const char *name, int namelen);
-          bool susfs_is_sus_mount_path(const char *mnt_path);
-          void susfs_sus_kstat_spoof(struct inode *inode, struct kstat *stat);
-          struct filename *susfs_get_redirected_path(unsigned long ino);
-          int susfs_spoof_uname(struct new_utsname *tmp);
-          int susfs_spoof_cmdline(struct seq_file *m);
-          bool susfs_is_sus_maps_ino(unsigned long ino, const char *path_str);
-          void susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
-          void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
-          void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
-          bool susfs_is_current_non_root_user_app_proc(void);
-          bool susfs_is_current_ksu_domain(void);
-          int path_umount(struct path *path, int flags);
-
-          #endif /* KSU_SUSFS_H */
-          """)
-
-          SUSFS_C = textwrap.dedent(r"""\
-          // SPDX-License-Identifier: GPL-2.0
-          #include <linux/module.h>
-          #include <linux/kernel.h>
-          #include <linux/fs.h>
-          #include <linux/path.h>
-          #include <linux/namei.h>
-          #include <linux/slab.h>
-          #include <linux/list.h>
-          #include <linux/hashtable.h>
-          #include <linux/spinlock.h>
-          #include <linux/uaccess.h>
-          #include <linux/seq_file.h>
-          #include <linux/utsname.h>
-          #include <linux/cred.h>
-          #include <linux/mount.h>
-          #include <linux/bitmap.h>
-          #include <linux/susfs.h>
-
-          bool susfs_is_log_enabled __read_mostly = true;
-          bool susfs_hide_sus_mnts_for_non_su_procs __read_mostly = true;
-          bool susfs_is_avc_log_spoofing_enabled __read_mostly = false;
-          bool susfs_is_umount_for_zygote_iso_service_enabled __read_mostly = false;
-
-          static DEFINE_SPINLOCK(susfs_spin_lock);
-          static LIST_HEAD(LH_SUS_PATH_LOOP);
-          static LIST_HEAD(LH_SUS_PATH_ANDROID_DATA);
-          static LIST_HEAD(LH_SUS_PATH_SDCARD);
-          static LIST_HEAD(LH_SUS_MOUNT);
-          static LIST_HEAD(LH_TRY_UMOUNT_PATH);
-          static DEFINE_HASHTABLE(SUS_KSTAT_HLIST, 10);
-          static DEFINE_HASHTABLE(OPEN_REDIRECT_HLIST, 10);
-
-          static struct st_external_dir android_data_path = { .cmd = CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH };
-          static struct st_external_dir sdcard_path = { .cmd = CMD_SUSFS_SET_SDCARD_ROOT_PATH };
-          static struct st_susfs_uname my_uname;
-          static bool uname_spoof_enabled = false;
-          static char *fake_cmdline_or_bootconfig = NULL;
-
-          /* Priority UID bitmap filter for app UID range 10000..19999 */
-          #define PRIORITY_UID_MIN 10000
-          #define PRIORITY_UID_MAX 19999
-          #define PRIORITY_UID_RANGE (PRIORITY_UID_MAX - PRIORITY_UID_MIN + 1)
-          static DECLARE_BITMAP(susfs_priority_uid_bitmap, PRIORITY_UID_RANGE);
-          static char susfs_priority_pkg_strings[4096];
-
-          bool susfs_is_current_non_root_user_app_proc(void)
-          {
-              if (susfs_is_current_proc_no_su())
-                  return true;
-              {
-                  uid_t uid = current_uid().val % 100000;
-                  return (uid >= 10000 && uid < 20000);
-              }
-          }
-          EXPORT_SYMBOL(susfs_is_current_non_root_user_app_proc);
-
-          int susfs_start_sdcard_monitor_fn(void)
-          {
-              SUSFS_LOGI("sdcard monitor started\n");
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_start_sdcard_monitor_fn);
-
-          static void susfs_mark_path_inode_bit(const char *pathname, unsigned long bit, uid_t i_uid, bool set_uid)
-          {
-              struct path p;
-              struct inode *inode;
-
-              if (!pathname || !pathname[0])
-                  return;
-              if (kern_path(pathname, LOOKUP_FOLLOW, &p) == 0) {
-                  inode = d_backing_inode(p.dentry);
-                  if (inode && inode->i_mapping) {
-                      set_bit(bit, &inode->i_mapping->flags);
-                      if (set_uid)
-                          inode->i_uid.val = i_uid;
-                  }
-                  path_put(&p);
-              }
-          }
-
-          int susfs_add_sus_path(void __user **user_info)
-          {
-              struct st_susfs_sus_path info = {0};
-              struct st_susfs_sus_path_list *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, info.i_uid != 0);
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (new_entry) {
-                  memcpy(&new_entry->info, &info, sizeof(info));
-                  strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
-                  new_entry->path_len = strlen(new_entry->target_pathname);
-                  spin_lock(&susfs_spin_lock);
-                  list_add_tail(&new_entry->list, &LH_SUS_PATH_ANDROID_DATA);
-                  spin_unlock(&susfs_spin_lock);
-              }
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              SUSFS_LOGI("sus_path added: %s\n", info.target_pathname);
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_sus_path);
-
-          int susfs_add_sus_path_loop(void __user **user_info)
-          {
-              struct st_susfs_sus_path info = {0};
-              struct st_susfs_sus_path_list *cursor, *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              spin_lock(&susfs_spin_lock);
-              list_for_each_entry(cursor, &LH_SUS_PATH_LOOP, list) {
-                  if (!strcmp(cursor->target_pathname, info.target_pathname)) {
-                      spin_unlock(&susfs_spin_lock);
-                      susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, false);
-                      info.err = 0;
-                      if (copy_to_user(*user_info, &info, sizeof(info)))
-                          return -EFAULT;
-                      return 0;
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (!new_entry)
-                  return -ENOMEM;
-              memcpy(&new_entry->info, &info, sizeof(info));
-              strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
-              new_entry->path_len = strlen(new_entry->target_pathname);
-              spin_lock(&susfs_spin_lock);
-              list_add_tail(&new_entry->list, &LH_SUS_PATH_LOOP);
-              spin_unlock(&susfs_spin_lock);
-
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, false);
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_sus_path_loop);
-
-          int susfs_set_i_state_on_external_dir(void __user **user_info)
-          {
-              struct st_external_dir info = {0};
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              if (info.cmd == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH) {
-                  strlcpy(android_data_path.target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
-                  android_data_path.is_inited = true;
-                  susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_ANDROID_DATA_ROOT_PATH, 0, false);
-              } else if (info.cmd == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
-                  strlcpy(sdcard_path.target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
-                  sdcard_path.is_inited = true;
-                  susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SDCARD_ROOT_PATH, 0, false);
-              }
-              info.is_inited = true;
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_i_state_on_external_dir);
-
-          bool susfs_is_inode_sus_path(struct inode *inode)
-          {
-              if (!inode || !inode->i_mapping)
-                  return false;
-              if (!susfs_is_current_non_root_user_app_proc())
-                  return false;
-              return test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
-          }
-          EXPORT_SYMBOL(susfs_is_inode_sus_path);
-
-          bool susfs_is_dentry_sus_path(struct dentry *dentry)
-          {
-              struct inode *inode;
-              if (!dentry)
-                  return false;
-              inode = d_backing_inode(dentry);
-              return susfs_is_inode_sus_path(inode);
-          }
-          EXPORT_SYMBOL(susfs_is_dentry_sus_path);
-
-          bool susfs_is_name_sus_path(struct inode *dir, const char *name, int namelen)
-          {
-              struct st_susfs_sus_path_list *cursor;
-              bool matched = false;
-
-              if (!name || namelen <= 0 || !susfs_is_current_non_root_user_app_proc())
-                  return false;
-
-              spin_lock(&susfs_spin_lock);
-              list_for_each_entry(cursor, &LH_SUS_PATH_ANDROID_DATA, list) {
-                  const char *base = strrchr(cursor->target_pathname, '/');
-                  base = base ? base + 1 : cursor->target_pathname;
-                  if (strlen(base) == (size_t)namelen && !strncmp(base, name, namelen)) {
-                      matched = true;
-                      break;
-                  }
-              }
-              if (!matched) {
-                  list_for_each_entry(cursor, &LH_SUS_PATH_LOOP, list) {
-                      const char *base = strrchr(cursor->target_pathname, '/');
-                      base = base ? base + 1 : cursor->target_pathname;
-                      if (strlen(base) == (size_t)namelen && !strncmp(base, name, namelen)) {
-                          matched = true;
-                          break;
-                      }
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-              return matched;
-          }
-          EXPORT_SYMBOL(susfs_is_name_sus_path);
-
-          int susfs_add_sus_mount(void __user **user_info)
-          {
-              struct st_susfs_sus_mount info = {0};
-              struct st_susfs_sus_mount_list *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (!new_entry)
-                  return -ENOMEM;
-              memcpy(&new_entry->info, &info, sizeof(info));
-              spin_lock(&susfs_spin_lock);
-              list_add_tail(&new_entry->list, &LH_SUS_MOUNT);
-              spin_unlock(&susfs_spin_lock);
-
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_MOUNT, 0, false);
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_sus_mount);
-
-          bool susfs_is_sus_mount_path(const char *mnt_path)
-          {
-              struct st_susfs_sus_mount_list *cursor;
-              bool found = false;
-
-              if (!mnt_path || !susfs_hide_sus_mnts_for_non_su_procs)
-                  return false;
-              if (!susfs_is_current_non_root_user_app_proc())
-                  return false;
-              if (!strncmp(mnt_path, "/data/adb", 9) || !strncmp(mnt_path, "/debug_ramdisk", 14))
-                  return true;
-
-              spin_lock(&susfs_spin_lock);
-              list_for_each_entry(cursor, &LH_SUS_MOUNT, list) {
-                  if (!strcmp(cursor->info.target_pathname, mnt_path)) {
-                      found = true;
-                      break;
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-              return found;
-          }
-          EXPORT_SYMBOL(susfs_is_sus_mount_path);
-
-          int susfs_add_sus_kstat(void __user **user_info)
-          {
-              struct st_susfs_sus_kstat info = {0};
-              struct st_susfs_sus_kstat_hlist *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (!new_entry)
-                  return -ENOMEM;
-              new_entry->target_ino = info.target_ino;
-              memcpy(&new_entry->info, &info, sizeof(info));
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_KSTAT, 0, false);
-
-              spin_lock(&susfs_spin_lock);
-              hash_add(SUS_KSTAT_HLIST, &new_entry->node, info.target_ino);
-              spin_unlock(&susfs_spin_lock);
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_sus_kstat);
-
-          int susfs_update_sus_kstat(void __user **user_info)
-          {
-              struct st_susfs_sus_kstat info = {0};
-              struct st_susfs_sus_kstat_hlist *entry;
-              struct hlist_node *tmp;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              spin_lock(&susfs_spin_lock);
-              hash_for_each_safe(SUS_KSTAT_HLIST, info.target_ino, tmp, entry, node) {
-                  if (!strcmp(entry->info.target_pathname, info.target_pathname)) {
-                      entry->info.target_ino = info.target_ino;
-                      entry->target_ino = info.target_ino;
-                      break;
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_KSTAT, 0, false);
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_update_sus_kstat);
-
-          void susfs_sus_kstat_spoof(struct inode *inode, struct kstat *stat)
-          {
-              struct st_susfs_sus_kstat_hlist *entry;
-
-              if (!inode || !stat || !inode->i_mapping)
-                  return;
-              if (!test_bit(AS_FLAGS_SUS_KSTAT, &inode->i_mapping->flags))
-                  return;
-              if (!susfs_is_current_non_root_user_app_proc())
-                  return;
-
-              spin_lock(&susfs_spin_lock);
-              hash_for_each_possible(SUS_KSTAT_HLIST, entry, node, inode->i_ino) {
-                  if (entry->target_ino == inode->i_ino) {
-                      stat->ino = entry->info.spoofed_ino;
-                      stat->dev = entry->info.spoofed_dev;
-                      stat->nlink = entry->info.spoofed_nlink;
-                      stat->size = entry->info.spoofed_size;
-                      stat->atime.tv_sec = entry->info.spoofed_atime_tv_sec;
-                      stat->atime.tv_nsec = entry->info.spoofed_atime_tv_nsec;
-                      stat->mtime.tv_sec = entry->info.spoofed_mtime_tv_sec;
-                      stat->mtime.tv_nsec = entry->info.spoofed_mtime_tv_nsec;
-                      stat->ctime.tv_sec = entry->info.spoofed_ctime_tv_sec;
-                      stat->ctime.tv_nsec = entry->info.spoofed_ctime_tv_nsec;
-                      stat->blksize = entry->info.spoofed_blksize;
-                      stat->blocks = entry->info.spoofed_blocks;
-                      break;
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-          }
-          EXPORT_SYMBOL(susfs_sus_kstat_spoof);
-
-          int susfs_add_try_umount(void __user **user_info)
-          {
-              struct st_susfs_try_umount info = {0};
-              struct st_susfs_try_umount_list *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (!new_entry)
-                  return -ENOMEM;
-              memcpy(&new_entry->info, &info, sizeof(info));
-              spin_lock(&susfs_spin_lock);
-              list_add_tail(&new_entry->list, &LH_TRY_UMOUNT_PATH);
-              spin_unlock(&susfs_spin_lock);
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_try_umount);
-
-          void susfs_try_umount(uid_t target_uid) {}
-          EXPORT_SYMBOL(susfs_try_umount);
-
-          void susfs_try_umount_all(uid_t target_uid) {}
-          EXPORT_SYMBOL(susfs_try_umount_all);
-
-          int susfs_set_uname(void __user **user_info)
-          {
-              struct st_susfs_uname info = {0};
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-
-              spin_lock(&susfs_spin_lock);
-              strlcpy(my_uname.release, info.release, sizeof(my_uname.release));
-              strlcpy(my_uname.version, info.version, sizeof(my_uname.version));
-              uname_spoof_enabled = (my_uname.release[0] != '\0' || my_uname.version[0] != '\0');
-              spin_unlock(&susfs_spin_lock);
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_uname);
-
-          int susfs_spoof_uname(struct new_utsname *tmp)
-          {
-              if (!tmp || !uname_spoof_enabled)
-                  return 0;
-              spin_lock(&susfs_spin_lock);
-              if (my_uname.release[0] && strcmp(my_uname.release, "default"))
-                  strlcpy(tmp->release, my_uname.release, __NEW_UTS_LEN + 1);
-              if (my_uname.version[0] && strcmp(my_uname.version, "default"))
-                  strlcpy(tmp->version, my_uname.version, __NEW_UTS_LEN + 1);
-              spin_unlock(&susfs_spin_lock);
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_spoof_uname);
-
-          int susfs_set_cmdline_or_bootconfig(void __user **user_info)
-          {
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (!fake_cmdline_or_bootconfig) {
-                  fake_cmdline_or_bootconfig = kzalloc(SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE, GFP_KERNEL);
-                  if (!fake_cmdline_or_bootconfig)
-                      return -ENOMEM;
-              }
-              if (strncpy_from_user(fake_cmdline_or_bootconfig, (const char __user *)*user_info,
-                                    SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1) < 0)
-                  return -EFAULT;
-              fake_cmdline_or_bootconfig[SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1] = '\0';
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_cmdline_or_bootconfig);
-
-          int susfs_spoof_cmdline(struct seq_file *m)
-          {
-              if (fake_cmdline_or_bootconfig && fake_cmdline_or_bootconfig[0] &&
-                  susfs_is_current_non_root_user_app_proc()) {
-                  seq_puts(m, fake_cmdline_or_bootconfig);
-                  seq_putc(m, '\n');
-                  return 1;
-              }
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_spoof_cmdline);
-
-          int susfs_add_open_redirect(void __user **user_info)
-          {
-              struct st_susfs_open_redirect info = {0};
-              struct st_susfs_open_redirect_hlist *new_entry;
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-              info.redirected_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-
-              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-              if (!new_entry)
-                  return -ENOMEM;
-              new_entry->target_ino = info.target_ino;
-              strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
-              strlcpy(new_entry->redirected_pathname, info.redirected_pathname, SUSFS_MAX_LEN_PATHNAME);
-
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_OPEN_REDIRECT, 0, false);
-              spin_lock(&susfs_spin_lock);
-              hash_add(OPEN_REDIRECT_HLIST, &new_entry->node, info.target_ino);
-              spin_unlock(&susfs_spin_lock);
-
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_open_redirect);
-
-          struct filename *susfs_get_redirected_path(unsigned long ino)
-          {
-              struct st_susfs_open_redirect_hlist *entry;
-              char buf[SUSFS_MAX_LEN_PATHNAME] = {0};
-              bool found = false;
-
-              spin_lock(&susfs_spin_lock);
-              hash_for_each_possible(OPEN_REDIRECT_HLIST, entry, node, ino) {
-                  if (entry->target_ino == ino) {
-                      strlcpy(buf, entry->redirected_pathname, sizeof(buf));
-                      found = true;
-                      break;
-                  }
-              }
-              spin_unlock(&susfs_spin_lock);
-              if (!found)
-                  return ERR_PTR(-ENOENT);
-              return getname_kernel(buf);
-          }
-          EXPORT_SYMBOL(susfs_get_redirected_path);
-
-          int susfs_add_sus_map(void __user **user_info)
-          {
-              struct st_susfs_sus_map info = {0};
-
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&info, *user_info, sizeof(info)))
-                  return -EFAULT;
-              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
-              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_MAP, 0, false);
-              info.err = 0;
-              if (copy_to_user(*user_info, &info, sizeof(info)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_add_sus_map);
-
-          bool susfs_is_sus_maps_ino(unsigned long ino, const char *path_str)
-          {
-              if (!susfs_is_current_non_root_user_app_proc())
-                  return false;
-              if (path_str && (!strncmp(path_str, "/data/adb", 9) || strstr(path_str, "kernelsu")))
-                  return true;
-              return false;
-          }
-          EXPORT_SYMBOL(susfs_is_sus_maps_ino);
-
-          int susfs_get_enabled_features(void __user **user_info)
-          {
-              static const char features[] =
-                  "CONFIG_KSU_SUSFS_SUS_PATH\n"
-                  "CONFIG_KSU_SUSFS_SUS_MOUNT\n"
-                  "CONFIG_KSU_SUSFS_SUS_KSTAT\n"
-                  "CONFIG_KSU_SUSFS_TRY_UMOUNT\n"
-                  "CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-                  "CONFIG_KSU_SUSFS_ENABLE_LOG\n"
-                  "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
-                  "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
-                  "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
-                  "CONFIG_KSU_SUSFS_SUS_MAP\n";
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_to_user(*user_info, features, sizeof(features)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_get_enabled_features);
-
-          int susfs_show_version(void __user **user_info)
-          {
-              static const char ver[] = SUSFS_VERSION;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_to_user(*user_info, ver, sizeof(ver)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_show_version);
-
-          int susfs_show_variant(void __user **user_info)
-          {
-              static const char var[] = SUSFS_VARIANT;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_to_user(*user_info, var, sizeof(var)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_show_variant);
-
-          int susfs_enable_log(void __user **user_info)
-          {
-              int enable = 0;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&enable, *user_info, sizeof(enable)))
-                  return -EFAULT;
-              susfs_is_log_enabled = (enable != 0);
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_enable_log);
-
-          int susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info)
-          {
-              bool hide = true;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&hide, *user_info, sizeof(hide)))
-                  return -EFAULT;
-              susfs_hide_sus_mnts_for_non_su_procs = hide;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_hide_sus_mnts_for_non_su_procs);
-
-          int susfs_set_umount_for_zygote_iso_service(void __user **user_info)
-          {
-              bool enable = false;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&enable, *user_info, sizeof(enable)))
-                  return -EFAULT;
-              susfs_is_umount_for_zygote_iso_service_enabled = enable;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_umount_for_zygote_iso_service);
-
-          int susfs_set_avc_log_spoofing(void __user **user_info)
-          {
-              bool enable = false;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_from_user(&enable, *user_info, sizeof(enable)))
-                  return -EFAULT;
-              susfs_is_avc_log_spoofing_enabled = enable;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_avc_log_spoofing);
-
-          int susfs_sus_su(void __user **user_info)
-          {
-              struct st_susfs_sus_su info = { .mode = SUS_SU_WITH_HOOKS, .err = 0 };
-              if (user_info && *user_info) {
-                  if (copy_to_user(*user_info, &info, sizeof(info)))
-                      return -EFAULT;
-              }
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_sus_su);
-
-          int susfs_show_sus_su_working_mode(void __user **user_info)
-          {
-              int mode = SUS_SU_WITH_HOOKS;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_to_user(*user_info, &mode, sizeof(mode)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_show_sus_su_working_mode);
-
-          int susfs_is_sus_su_ready(void __user **user_info)
-          {
-              bool ready = true;
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (copy_to_user(*user_info, &ready, sizeof(ready)))
-                  return -EFAULT;
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_is_sus_su_ready);
-
-          void susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target) {}
-          EXPORT_SYMBOL(susfs_auto_add_sus_bind_mount);
-
-          void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname) {}
-          EXPORT_SYMBOL(susfs_auto_add_sus_ksu_default_mount);
-
-          void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {}
-          EXPORT_SYMBOL(susfs_auto_add_try_umount_for_bind_mount);
-
-          void susfs_parse_priority_app_strings(void)
-          {
-              /* Refreshes the priority UID filter bitmap when package list is updated */
-              SUSFS_LOGI("refreshed priority app uid filter\n");
-          }
-          EXPORT_SYMBOL(susfs_parse_priority_app_strings);
-
-          int susfs_set_priority_uid_filter(void __user **user_info)
-          {
-              if (!user_info || !*user_info)
-                  return -EINVAL;
-              if (strncpy_from_user(susfs_priority_pkg_strings, (const char __user *)*user_info,
-                                    sizeof(susfs_priority_pkg_strings) - 1) < 0)
-                  return -EFAULT;
-              susfs_priority_pkg_strings[sizeof(susfs_priority_pkg_strings) - 1] = '\0';
-              susfs_parse_priority_app_strings();
-              return 0;
-          }
-          EXPORT_SYMBOL(susfs_set_priority_uid_filter);
-
-          bool susfs_is_uid_priority_filtered(uid_t target_uid)
-          {
-              uid_t norm = target_uid % 100000;
-              if (norm < PRIORITY_UID_MIN || norm > PRIORITY_UID_MAX)
-                  return false;
-              return test_bit(norm - PRIORITY_UID_MIN, susfs_priority_uid_bitmap);
-          }
-          EXPORT_SYMBOL(susfs_is_uid_priority_filtered);
-
-          void susfs_init(void)
-          {
-              bitmap_zero(susfs_priority_uid_bitmap, PRIORITY_UID_RANGE);
-              pr_info("susfs: initialized SuSFS %s (%s) for SukiSU-Ultra\n", SUSFS_VERSION, SUSFS_VARIANT);
-          }
-          EXPORT_SYMBOL(susfs_init);
-          """)
-
-
-          def read(path):
-              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
-                  return f.read()
-
-
-          def write(path, text):
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-                  f.write(text)
-
-
-          def ensure_include(path, header="<linux/susfs.h>"):
-              text = read(path)
-              inc = f"#ifdef CONFIG_KSU_SUSFS\n#include {header}\n#endif\n"
-              if header in text:
-                  return
-              idx = text.find("\n#include ")
-              if idx >= 0:
-                  eol = text.find("\n", idx + 1) + 1
-                  write(path, text[:eol] + inc + text[eol:])
-
-
-          def patch_func_hook(path, func_sig, anchor, mode, snippet):
-              if not os.path.isfile(path):
-                  return False
-              text = read(path)
-              if snippet.strip() in text:
-                  return False
-              pos_sig = text.find(func_sig)
-              if pos_sig < 0:
-                  return False
-              end_fn = text.find("\n}\n", pos_sig)
-              if end_fn < 0:
-                  end_fn = len(text)
-              pos_anchor = text.find(anchor, pos_sig)
-              if pos_anchor < 0 or pos_anchor > end_fn:
-                  return False
-              ins_at = pos_anchor if mode == "before" else pos_anchor + len(anchor)
-              block = (
-                  "\n#ifdef CONFIG_KSU_SUSFS\n"
-                  "#pragma GCC diagnostic push\n"
-                  "#pragma GCC diagnostic ignored \"-Wdeclaration-after-statement\"\n"
-                  + snippet + "\n"
-                  "#pragma GCC diagnostic pop\n"
-                  "#endif\n"
-              )
-              write(path, text[:ins_at] + block + text[ins_at:])
-              return True
-
-
-          def ensure_path_umount_in_namespace(root):
-              """
-              Backport can_umount() and path_umount() to fs/namespace.c (Linux 4.14),
-              placed strictly AFTER `may_mount()` (around line 1808) so both `do_umount()`
-              and `may_mount()` are already defined above `can_umount()`.
-              """
-              ns_path = os.path.join(root, "fs/namespace.c")
-              if not os.path.isfile(ns_path):
-                  return
-              text = read(ns_path)
-              if re.search(r"\bint\s+path_umount\s*\(", text):
-                  print("[=] fs/namespace.c: path_umount already present")
-                  return
-              m = re.search(r"static\s+(?:inline\s+)?bool\s+may_mount\s*\([^)]*\)\s*\{", text)
-              if not m:
-                  m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
-              if not m:
-                  return
-              end_fn = text.find("\n}\n", m.start())
-              if end_fn < 0:
-                  return
-              ins_pos = end_fn + 3
-              has_can_umount = bool(re.search(r"\bcan_umount\s*\(", text))
-              can_umount_fn = "" if has_can_umount else (
-                  "\nstatic int can_umount(const struct path *path, int flags)\n"
-                  "{\n"
-                  "\tstruct mount *mnt = real_mount(path->mnt);\n\n"
-                  "\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n"
-                  "\t\treturn -EINVAL;\n"
-                  "\tif (!may_mount())\n"
-                  "\t\treturn -EPERM;\n"
-                  "\tif (path->dentry != path->mnt->mnt_root)\n"
-                  "\t\treturn -EINVAL;\n"
-                  "\tif (!check_mnt(mnt))\n"
-                  "\t\treturn -EINVAL;\n"
-                  "\tif (mnt->mnt.mnt_flags & MNT_LOCKED)\n"
-                  "\t\treturn -EINVAL;\n"
-                  "\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n"
-                  "\t\treturn -EPERM;\n"
-                  "\treturn 0;\n"
-                  "}\n"
-              )
-              path_umount_fn = can_umount_fn + (
-                  "\nint path_umount(struct path *path, int flags)\n"
-                  "{\n"
-                  "\tstruct mount *mnt = real_mount(path->mnt);\n"
-                  "\tint ret;\n\n"
-                  "\tret = can_umount(path, flags);\n"
-                  "\tif (!ret)\n"
-                  "\t\tret = do_umount(mnt, flags);\n\n"
-                  "\t/* we mustn't call path_put() as that would clear mnt_expiry_mark */\n"
-                  "\tdput(path->dentry);\n"
-                  "\tmntput_no_expire(mnt);\n"
-                  "\treturn ret;\n"
-                  "}\n"
-                  "EXPORT_SYMBOL(path_umount);\n"
-              )
-              write(ns_path, text[:ins_pos] + path_umount_fn + text[ins_pos:])
-              internal_h = os.path.join(root, "fs/internal.h")
-              if os.path.isfile(internal_h):
-                  ih = read(internal_h)
-                  if "path_umount" not in ih:
-                      write(internal_h, ih + "\nextern int path_umount(struct path *path, int flags);\n")
-              print("[+] backported can_umount() + path_umount() after may_mount() in fs/namespace.c")
-
-
-          def sync_ksu_extern_susfs_symbols(root, susfs_def_path, susfs_h_path, susfs_c_path):
-              """
-              Scan all .c and .h files in KernelSU/kernel/ for `extern ... susfs_*`
-              declarations (both functions like `susfs_add_sus_avd_allowed_by_type` and
-              variables/functions like `susfs_extra_works`), and synthesize exact matching
-              definitions in `fs/susfs.c` and declarations in `include/linux/susfs.h` for
-              any `susfs_*` symbol not already defined in `fs/susfs.c` or `KernelSU/kernel/`.
-              """
-              ksu_dir = os.path.join(root, "KernelSU", "kernel")
-              if not os.path.isdir(ksu_dir):
-                  return
-              all_files = (
-                  glob.glob(os.path.join(ksu_dir, "**/*.c"), recursive=True) +
-                  glob.glob(os.path.join(ksu_dir, "**/*.h"), recursive=True)
-              )
-              c_text = read(susfs_c_path)
-              h_text = read(susfs_h_path)
-              def_text = read(susfs_def_path)
-
-              defined_syms = set()
-              for m in re.finditer(r"EXPORT_SYMBOL\(\s*(susfs_[a-zA-Z0-9_]+)\s*\)", c_text):
-                  defined_syms.add(m.group(1))
-              for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\b", def_text):
-                  defined_syms.add(m.group(1))
-              for fp in all_files:
-                  src = read(fp)
-                  for m in re.finditer(
-                      r"(?m)^[ \t]*(?!extern\b)(?:static\s+)?(?:inline\s+)?(?:bool|int|void|u32|long|ssize_t|char\s*\*)\s+(susfs_[a-zA-Z0-9_]+)\s*\([^;]*\)\s*\{",
-                      src,
-                  ):
-                      defined_syms.add(m.group(1))
-
-              extra_h = []
-              extra_c = []
-              type_kw = {
-                  "int", "char", "long", "short", "void", "bool", "u8", "u16", "u32", "u64",
-                  "s8", "s16", "s32", "s64", "uid_t", "gid_t", "pid_t", "size_t", "ssize_t",
-                  "unsigned", "signed", "const", "volatile", "struct",
-              }
-
-              for fp in all_files:
-                  src = read(fp)
-                  # 1. Match extern function declarations: extern <ret> susfs_foo(<args>);
-                  for m in re.finditer(
-                      r"\bextern\s+((?:const\s+|unsigned\s+|signed\s+|struct\s+\w+\s*\*?\s*|[a-zA-Z0-9_]+\s*\*?\s*)+?)\s*\b(susfs_[a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*;",
-                      src,
-                  ):
-                      ret_type = " ".join(m.group(1).split())
-                      fn_name = m.group(2).strip()
-                      params = " ".join(m.group(3).split())
-                      if fn_name in defined_syms:
-                          continue
-                      defined_syms.add(fn_name)
-                      if params and params != "void":
-                          param_list = []
-                          for idx, p in enumerate(params.split(",")):
-                              p = p.strip()
-                              tokens = re.findall(r"[a-zA-Z0-9_]+|\*", p)
-                              if len(tokens) >= 2 and tokens[-1] != "*" and tokens[-1] not in type_kw:
-                                  param_list.append(p)
-                              else:
-                                  param_list.append(f"{p} arg{idx}")
-                          params_def = ", ".join(param_list)
-                      else:
-                          params_def = "void"
-                      ret_stmt = "\treturn 0;\n" if ret_type != "void" else ""
-                      extra_h.append(f"{ret_type} {fn_name}({params or 'void'});")
-                      extra_c.append(f"{ret_type} {fn_name}({params_def})\n{{\n{ret_stmt}}}\nEXPORT_SYMBOL({fn_name});")
-                      print(f"[+] synthesized extern function from {os.path.relpath(fp, ksu_dir)}: {ret_type} {fn_name}({params_def})")
-
-                  # 2. Match extern variable declarations: extern <type> susfs_bar;
-                  for m in re.finditer(
-                      r"\bextern\s+((?:const\s+|unsigned\s+|signed\s+|struct\s+\w+\s*\*?\s*|[a-zA-Z0-9_]+\s*\*?\s*)+?)\s*\b(susfs_[a-zA-Z0-9_]+)\s*;",
-                      src,
-                  ):
-                      var_type = " ".join(m.group(1).split())
-                      var_name = m.group(2).strip()
-                      if var_name in defined_syms:
-                          continue
-                      defined_syms.add(var_name)
-                      init_val = "true" if var_type == "bool" else "0"
-                      extra_h.append(f"extern {var_type} {var_name};")
-                      extra_c.append(f"{var_type} {var_name} __read_mostly = {init_val};\nEXPORT_SYMBOL({var_name});")
-                      print(f"[+] synthesized extern variable from {os.path.relpath(fp, ksu_dir)}: {var_type} {var_name} = {init_val}")
-
-              if extra_h:
-                  h_text = h_text.replace(
-                      "#endif /* KSU_SUSFS_H */",
-                      "\n/* Auto-synthesized SukiSU-Ultra extern symbols */\n" + "\n".join(extra_h) + "\n\n#endif /* KSU_SUSFS_H */",
-                  )
-                  write(susfs_h_path, h_text)
-              if extra_c:
-                  c_text += "\n/* Auto-synthesized SukiSU-Ultra extern symbols */\n" + "\n\n".join(extra_c) + "\n"
-                  write(susfs_c_path, c_text)
-
-
-          def main():
-              root = os.path.abspath(sys.argv[1])
-              susfs_def_path = os.path.join(root, "include/linux/susfs_def.h")
-              susfs_h_path = os.path.join(root, "include/linux/susfs.h")
-              susfs_c_path = os.path.join(root, "fs/susfs.c")
-
-              write(susfs_def_path, SUSFS_DEF_H)
-              write(susfs_h_path, SUSFS_H)
-              write(susfs_c_path, SUSFS_C)
-              print("[+] wrote include/linux/susfs_def.h, include/linux/susfs.h, fs/susfs.c")
-
-              ensure_path_umount_in_namespace(root)
-              sync_ksu_extern_susfs_symbols(root, susfs_def_path, susfs_h_path, susfs_c_path)
-
-              # Wire fs/Makefile
-              fs_mk = os.path.join(root, "fs/Makefile")
-              mk_text = read(fs_mk)
-              if "susfs.o" not in mk_text:
-                  mk_text += "\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
-                  write(fs_mk, mk_text)
-                  print("[+] wired fs/susfs.o in fs/Makefile")
-
-              # Apply idempotent kernel hooks for 4.14 (all anchors placed strictly after local declarations)
-              hooks = [
-                  # 1. Spoof uname in kernel/sys.c
-                  ("kernel/sys.c",
-                   "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)",
-                   "up_read(&uts_sem);",
-                   "after",
-                   "\tsusfs_spoof_uname(&tmp);"),
-                  # 2. Spoof /proc/cmdline in fs/proc/cmdline.c (before seq_puts statement)
-                  ("fs/proc/cmdline.c",
-                   "static int cmdline_proc_show(struct seq_file *m, void *v)",
-                   "seq_puts(m, saved_command_line);",
-                   "before",
-                   "\tif (susfs_spoof_cmdline(m))\n\t\treturn 0;\n"),
-                  # 3. Spoof kstat in fs/stat.c at the end of generic_fillattr
-                  ("fs/stat.c",
-                   "void generic_fillattr(struct inode *inode, struct kstat *stat)",
-                   "stat->blocks = inode->i_blocks;",
-                   "after",
-                   "\tsusfs_sus_kstat_spoof(inode, stat);"),
-                  # 4. Hide sus_path in fs/readdir.c (filldir / filldir64, after all local variable declarations)
-                  ("fs/readdir.c",
-                   "static int filldir(struct dir_context *ctx, const char *name, int namlen,",
-                   "buf->error = verify_dirent_name(name, namlen);",
-                   "before",
-                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;\n"),
-                  ("fs/readdir.c",
-                   "static int filldir64(struct dir_context *ctx, const char *name, int namlen,",
-                   "buf->error = verify_dirent_name(name, namlen);",
-                   "before",
-                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;\n"),
-                  # 5. Hide ksu/susfs symbols from /proc/kallsyms for non-root apps (before first if statement)
-                  ("kernel/kallsyms.c",
-                   "static int s_show(struct seq_file *m, void *p)",
-                   "if (!iter->name[0])",
-                   "before",
-                   "#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
-                   "\tif (susfs_is_current_non_root_user_app_proc() &&\n"
-                   "\t    (!strncmp(iter->name, \"ksu_\", 4) || !strncmp(iter->name, \"__ksu_\", 6) ||\n"
-                   "\t     !strncmp(iter->name, \"susfs_\", 6) || !strncmp(iter->name, \"__susfs_\", 8)))\n"
-                   "\t\treturn 0;\n"
-                   "#endif\n"),
-              ]
-
-              for rel, sig, anchor, mode, code in hooks:
-                  full = os.path.join(root, rel)
-                  if os.path.isfile(full):
-                      ensure_include(full)
-                      if patch_func_hook(full, sig, anchor, mode, code):
-                          print(f"[+] hooked {rel} ({sig[:40]}...)")
-                      else:
-                          print(f"[=] {rel}: hook already present or anchor skipped")
-
-              print("[+] SuSFS 4.14 integration complete")
-
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-          python3 -I "$RUNNER_TEMP/integrate_susfs_suki_414.py" .
-
       - name: Integrate NoMount
         if: ${{ inputs.enable_nomount }}
         env:
@@ -1823,8 +905,8 @@ jobs:
           FORCE_MODULE: ${{ inputs.force_module }}
           ENABLE_KSU: ${{ inputs.enable_ksu }}
           ENABLE_KPM: ${{ inputs.enable_kpm }}
-          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
         run: |
           set -e
           export BSP_BUILD_FAMILY=qogirl6
@@ -1846,22 +928,11 @@ jobs:
           if [ "$ENABLE_KSU" = "true" ]; then
             scripts/config --file out/.config -e KSU
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              scripts/config --file out/.config \
-                -e KSU_SUSFS \
-                -e KSU_SUSFS_SUS_PATH \
-                -e KSU_SUSFS_SUS_MOUNT \
-                -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-                -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-                -e KSU_SUSFS_SUS_KSTAT \
-                -e KSU_SUSFS_TRY_UMOUNT \
-                -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-                -e KSU_SUSFS_SPOOF_UNAME \
-                -e KSU_SUSFS_ENABLE_LOG \
-                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-                -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-                -e KSU_SUSFS_OPEN_REDIRECT \
-                -e KSU_SUSFS_SUS_MAP \
-                -d KSU_SUSFS_SUS_SU
+              scripts/config --file out/.config -e KSU_SUSFS \
+                -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+                -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP
             else
               scripts/config --file out/.config -d KSU_SUSFS
             fi
@@ -1880,16 +951,16 @@ jobs:
           $KMAKE olddefconfig
 
           echo "---- resulting config ----"
-          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|NOMOUNT|KEYS|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
+          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|NOMOUNT|KEYS|THREAD_INFO_IN_TASK|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
 
           if [ "$ENABLE_KSU" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
             if [ "$ENABLE_SUSFS" = "true" ]; then
               grep -q '^CONFIG_KSU_SUSFS=y' out/.config
-            else
-              if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
-                echo "::error::KSU_SUSFS is enabled when enable_susfs=false"; exit 1
-              fi
+              grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y' out/.config
+              grep -q '^CONFIG_KSU_SUSFS_SUS_PATH=y' out/.config
+            elif grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+              echo "::error::KSU_SUSFS is enabled but SUSFS is not integrated"; exit 1
             fi
             if [ "$ENABLE_KPM" = "true" ]; then grep -q '^CONFIG_KPM=y' out/.config; fi
           fi
@@ -1927,11 +998,11 @@ jobs:
       - name: Collect output
         env:
           ENABLE_KSU: ${{ inputs.enable_ksu }}
-          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
         run: |
           set -e
-          # SukiSU & SuSFS must not change core struct layouts (would break stock vendor modules via modversions)
+          # SukiSU must not change struct layouts (would break stock vendor modules via modversions)
           if ! git diff --quiet -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h; then
             echo "::error::a core header was modified (struct layout changed)"
             git diff -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h
@@ -1944,13 +1015,18 @@ jobs:
           fi
           if [ "$ENABLE_KSU" = "true" ]; then
             # every hook the patched kernel files call must be defined in the final image
-            n=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|faccessat|stat|vfs_read|vfs_fstat|sys_reboot)$')
-            echo "ksu hook symbols in vmlinux: $n (expected 6)"
-            [ "$n" -eq 6 ]
+            NMB="$HOME/tc/gcc64/bin/aarch64-linux-android-nm"
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              s=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -ci ' [tT] susfs_')
-              echo "SuSFS symbols in vmlinux: $s"
-              [ "$s" -gt 0 ]
+              n=$($NMB out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|execveat_sucompat|faccessat|stat|sys_read|vfs_fstat|sys_reboot|setresuid|input_handle_event)$')
+              echo "ksu hook symbols in vmlinux: $n (expected 9)"
+              [ "$n" -eq 9 ]
+              s=$($NMB out/vmlinux | grep -cE ' [Tt] susfs_(add_sus_path|add_sus_map|set_hide_sus_mnts_for_non_su_procs)$')
+              echo "susfs symbols in vmlinux: $s (expected 3)"
+              [ "$s" -eq 3 ]
+            else
+              n=$($NMB out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|faccessat|stat|vfs_read|vfs_fstat|sys_reboot)$')
+              echo "ksu hook symbols in vmlinux: $n (expected 6)"
+              [ "$n" -eq 6 ]
             fi
           fi
           test -f out/arch/arm64/boot/Image
@@ -1965,15 +1041,15 @@ jobs:
           rm -rf ak3/.git ak3/.github ak3/README.md
           cp out/arch/arm64/boot/Image ak3/Image
           sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SuSFS + NoMount/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SUSFS + NoMount/' ak3/anykernel.sh
           sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
-          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-SuSFS-${KSU_REL}.zip" . -x '*.git*')
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
           ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gta4lve-sukisu-ultra-susfs
+          name: gta4lve-sukisu-ultra
           path: dist/*.zip
           if-no-files-found: error
 
