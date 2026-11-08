@@ -954,6 +954,15 @@ jobs:
 
           KMAKE="make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
 
+          # SukiSU's Makefile enables its preinit runner only when the generated
+          # UAPI header exists while the driver Makefile is parsed. Generate it
+          # before defconfig/build; otherwise KSU_NO_PREINIT is defined and ksud
+          # never gets the early userspace hand-off on this non-GKI 4.14 device.
+          if [ "$ENABLE_KSU" = "true" ]; then
+            $KMAKE headers_install
+            test -f out/usr/include/linux/unistd.h
+          fi
+
           $KMAKE "$DEFCONFIG"
 
           if [ "$ENABLE_KSU" = "true" ]; then
