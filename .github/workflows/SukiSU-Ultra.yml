@@ -409,8 +409,8 @@ jobs:
              UID range checks.
           2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
              including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `can_umount` +
-             `path_umount` 4.14 backport in `fs/namespace.c`, and preserving SukiSU-Ultra's own
-             SELinux `susfs_*` definitions in `drivers/kernelsu/selinux/`.
+             `path_umount` 4.14 backport in `fs/namespace.c` (placed after `may_mount`), and
+             preserving SukiSU-Ultra's own SELinux `susfs_*` definitions in `drivers/kernelsu/selinux/`.
           3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
              `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
              variable declarations.
@@ -1477,7 +1477,11 @@ jobs:
 
 
           def ensure_path_umount_in_namespace(root):
-              """Backport can_umount() and path_umount() to fs/namespace.c (Linux 4.14)."""
+              """
+              Backport can_umount() and path_umount() to fs/namespace.c (Linux 4.14),
+              placed strictly AFTER `may_mount()` (around line 1808) so both `do_umount()`
+              and `may_mount()` are already defined above `can_umount()`.
+              """
               ns_path = os.path.join(root, "fs/namespace.c")
               if not os.path.isfile(ns_path):
                   return
@@ -1485,13 +1489,16 @@ jobs:
               if re.search(r"\bint\s+path_umount\s*\(", text):
                   print("[=] fs/namespace.c: path_umount already present")
                   return
-              m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
+              # Anchor after may_mount() if present, else after do_umount()
+              m = re.search(r"static\s+(?:inline\s+)?bool\s+may_mount\s*\([^)]*\)\s*\{", text)
+              if not m:
+                  m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
               if not m:
                   return
-              end_do = text.find("\n}\n", m.start())
-              if end_do < 0:
+              end_fn = text.find("\n}\n", m.start())
+              if end_fn < 0:
                   return
-              ins_pos = end_do + 3
+              ins_pos = end_fn + 3
               has_can_umount = bool(re.search(r"\bcan_umount\s*\(", text))
               can_umount_fn = "" if has_can_umount else (
                   "\nstatic int can_umount(const struct path *path, int flags)\n"
@@ -1533,7 +1540,7 @@ jobs:
                   ih = read(internal_h)
                   if "path_umount" not in ih:
                       write(internal_h, ih + "\nextern int path_umount(struct path *path, int flags);\n")
-              print("[+] backported can_umount() + path_umount() to fs/namespace.c and fs/internal.h")
+              print("[+] backported can_umount() + path_umount() after may_mount() in fs/namespace.c")
 
 
           def fix_sukisu_internal_susfs_declarations(root):
