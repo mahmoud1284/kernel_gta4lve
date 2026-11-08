@@ -410,9 +410,9 @@ jobs:
           2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
              including both SuSFS v1.5.x/v2.x supercalls and priority UID filter APIs
              (`susfs_parse_priority_app_strings`, `susfs_set_priority_uid_filter`, etc.).
-          3. Idempotent inline hooks in `fs/namei.c`, `fs/readdir.c`, `fs/stat.c`, `fs/open.c`,
-             `fs/proc_namespace.c`, `fs/proc/task_mmu.c`, `fs/proc/cmdline.c`, `kernel/sys.c`,
-             and `kernel/kallsyms.c`.
+          3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
+             `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
+             variable declarations (and guarded with `-Wdeclaration-after-statement` pragmas).
           """
           import glob
           import os
@@ -1442,7 +1442,14 @@ jobs:
               if pos_anchor < 0 or pos_anchor > end_fn:
                   return False
               ins_at = pos_anchor if mode == "before" else pos_anchor + len(anchor)
-              block = "\n#ifdef CONFIG_KSU_SUSFS\n" + snippet + "\n#endif\n"
+              block = (
+                  "\n#ifdef CONFIG_KSU_SUSFS\n"
+                  "#pragma GCC diagnostic push\n"
+                  "#pragma GCC diagnostic ignored \"-Wdeclaration-after-statement\"\n"
+                  + snippet + "\n"
+                  "#pragma GCC diagnostic pop\n"
+                  "#endif\n"
+              )
               write(path, text[:ins_at] + block + text[ins_at:])
               return True
 
@@ -1516,10 +1523,10 @@ jobs:
               mk_text = read(fs_mk)
               if "susfs.o" not in mk_text:
                   mk_text += "\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
-                  write(fs_mk, mk_mk_text := mk_text)
+                  write(fs_mk, mk_text)
                   print("[+] wired fs/susfs.o in fs/Makefile")
 
-              # Apply idempotent kernel hooks for 4.14
+              # Apply idempotent kernel hooks for 4.14 (all anchors placed strictly after local declarations)
               hooks = [
                   # 1. Spoof uname in kernel/sys.c
                   ("kernel/sys.c",
@@ -1527,40 +1534,40 @@ jobs:
                    "up_read(&uts_sem);",
                    "after",
                    "\tsusfs_spoof_uname(&tmp);"),
-                  # 2. Spoof /proc/cmdline in fs/proc/cmdline.c
+                  # 2. Spoof /proc/cmdline in fs/proc/cmdline.c (before seq_puts statement)
                   ("fs/proc/cmdline.c",
                    "static int cmdline_proc_show(struct seq_file *m, void *v)",
-                   "{",
-                   "after",
-                   "\tif (susfs_spoof_cmdline(m))\n\t\treturn 0;"),
-                  # 3. Spoof kstat in fs/stat.c
+                   "seq_puts(m, saved_command_line);",
+                   "before",
+                   "\tif (susfs_spoof_cmdline(m))\n\t\treturn 0;\n"),
+                  # 3. Spoof kstat in fs/stat.c at the end of generic_fillattr
                   ("fs/stat.c",
-                   "int vfs_getattr_nosec(const struct path *path, struct kstat *stat,",
-                   "inode = d_backing_inode(path->dentry);",
+                   "void generic_fillattr(struct inode *inode, struct kstat *stat)",
+                   "stat->blocks = inode->i_blocks;",
                    "after",
                    "\tsusfs_sus_kstat_spoof(inode, stat);"),
-                  # 4. Hide sus_path in fs/readdir.c (filldir / filldir64)
+                  # 4. Hide sus_path in fs/readdir.c (filldir / filldir64, after all local variable declarations)
                   ("fs/readdir.c",
                    "static int filldir(struct dir_context *ctx, const char *name, int namlen,",
-                   "int reclen = ALIGN(offsetof(struct linux_dirent, d_name) + namlen + 2,",
+                   "buf->error = verify_dirent_name(name, namlen);",
                    "before",
-                   "\tif (susfs_is_name_sus_path( NULL, name, namlen))\n\t\treturn 0;"),
+                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;\n"),
                   ("fs/readdir.c",
                    "static int filldir64(struct dir_context *ctx, const char *name, int namlen,",
-                   "int reclen = ALIGN(offsetof(struct linux_dirent64, d_name) + namlen + 1,",
+                   "buf->error = verify_dirent_name(name, namlen);",
                    "before",
-                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;"),
-                  # 5. Hide ksu/susfs symbols from /proc/kallsyms for non-root apps
+                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;\n"),
+                  # 5. Hide ksu/susfs symbols from /proc/kallsyms for non-root apps (before first if statement)
                   ("kernel/kallsyms.c",
                    "static int s_show(struct seq_file *m, void *p)",
-                   "struct kallsym_iter *iter = m->private;",
-                   "after",
+                   "if (!iter->name[0])",
+                   "before",
                    "#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
                    "\tif (susfs_is_current_non_root_user_app_proc() &&\n"
                    "\t    (!strncmp(iter->name, \"ksu_\", 4) || !strncmp(iter->name, \"__ksu_\", 6) ||\n"
                    "\t     !strncmp(iter->name, \"susfs_\", 6) || !strncmp(iter->name, \"__susfs_\", 8)))\n"
                    "\t\treturn 0;\n"
-                   "#endif"),
+                   "#endif\n"),
               ]
 
               for rel, sig, anchor, mode, code in hooks:
