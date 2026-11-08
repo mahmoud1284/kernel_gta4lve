@@ -213,6 +213,22 @@ jobs:
             exit 1
           fi
           git -C KernelSU apply "$RUNNER_TEMP/sukisu-4.14-compat.patch"
+
+          # Linux 4.14 exports sys_close(), not ksys_close(). The newer SukiSU
+          # preinit source selects ksys_close for every kernel older than 5.11;
+          # use the 4.14 syscall entry point so preinit.o can compile and ksud
+          # can be launched during early boot.
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path("KernelSU/kernel/preinit/preinit.c")
+          s = p.read_text()
+          old = "#define ksu_close_fd_compat(fd) ksys_close(fd)"
+          new = "#define ksu_close_fd_compat(fd) sys_close(fd)"
+          if s.count(old) != 1:
+              raise SystemExit("expected one ksys_close compatibility macro")
+          p.write_text(s.replace(old, new, 1))
+          PYFIX
+          grep -n 'ksu_close_fd_compat' KernelSU/kernel/preinit/preinit.c
           echo "compat patch applied"
 
           # clang (-Werror) rejects two harmless things in SukiSU on this toolchain:
