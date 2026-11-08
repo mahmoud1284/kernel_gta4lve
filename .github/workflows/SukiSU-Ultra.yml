@@ -229,6 +229,33 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PYFIX
           grep -n 'ksu_close_fd_compat' KernelSU/kernel/preinit/preinit.c
+
+          # The embedded runner from newer SukiSU assumes newer UAPI headers:
+          # Linux 4.14 has no clone3/struct clone_args and has no linux/mount.h.
+          # Keep preinit enabled, but use the legacy clone syscall and fs.h flags.
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          sys_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys.h")
+          s = sys_h.read_text()
+          marker = "\t * clone() could be used but has different argument orders per\n"
+          start = s.index(marker, s.index("pid_t sys_vfork(void)")) - len("\t/*\n")
+          end_marker = "\t\treturn my_syscall2(__NR_clone3, &args, sizeof(args));"
+          end = s.index(end_marker, start) + len(end_marker)
+          replacement = ("\t\t/* Linux 4.14 has clone() but not clone3(). */\n"
+                         "#if defined(__NR_clone)\n"
+                         "\t\treturn my_syscall5(__NR_clone,\n"
+                         "\t\t\tCLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0);\n"
+                         "#else\n"
+                         "\t\treturn -ENOSYS;\n"
+                         "#endif")
+          sys_h.write_text(s[:start] + replacement + s[end:])
+          mount_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys/mount.h")
+          s = mount_h.read_text()
+          if s.count("#include <linux/mount.h>") != 1:
+              raise SystemExit("linux/mount.h include not found")
+          mount_h.write_text(s.replace("#include <linux/mount.h>", "#include <linux/fs.h>", 1))
+          PYFIX
+          ! grep -RInE 'struct clone_args|__NR_clone3|<linux/mount.h>' KernelSU/kernel/preinit/runner/nolibc
           echo "compat patch applied"
 
           # clang (-Werror) rejects two harmless things in SukiSU on this toolchain:
