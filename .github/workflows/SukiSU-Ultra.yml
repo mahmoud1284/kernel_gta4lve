@@ -408,9 +408,9 @@ jobs:
              high bits in `inode->i_mapping->flags`, and per-task non-root app state uses
              UID range checks.
           2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
-             including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `path_umount`
-             4.14 backport in `fs/namespace.c`, and preserving SukiSU-Ultra's own SELinux
-             `susfs_*` definitions in `drivers/kernelsu/selinux/`.
+             including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `can_umount` +
+             `path_umount` 4.14 backport in `fs/namespace.c`, and preserving SukiSU-Ultra's own
+             SELinux `susfs_*` definitions in `drivers/kernelsu/selinux/`.
           3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
              `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
              variable declarations.
@@ -1477,7 +1477,7 @@ jobs:
 
 
           def ensure_path_umount_in_namespace(root):
-              """Backport path_umount(struct path *path, int flags) to fs/namespace.c if absent."""
+              """Backport can_umount() and path_umount() to fs/namespace.c (Linux 4.14)."""
               ns_path = os.path.join(root, "fs/namespace.c")
               if not os.path.isfile(ns_path):
                   return
@@ -1488,12 +1488,31 @@ jobs:
               m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
               if not m:
                   return
-              # Find end of do_umount
               end_do = text.find("\n}\n", m.start())
               if end_do < 0:
                   return
               ins_pos = end_do + 3
-              path_umount_fn = (
+              has_can_umount = bool(re.search(r"\bcan_umount\s*\(", text))
+              can_umount_fn = "" if has_can_umount else (
+                  "\nstatic int can_umount(const struct path *path, int flags)\n"
+                  "{\n"
+                  "\tstruct mount *mnt = real_mount(path->mnt);\n\n"
+                  "\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n"
+                  "\t\treturn -EINVAL;\n"
+                  "\tif (!may_mount())\n"
+                  "\t\treturn -EPERM;\n"
+                  "\tif (path->dentry != path->mnt->mnt_root)\n"
+                  "\t\treturn -EINVAL;\n"
+                  "\tif (!check_mnt(mnt))\n"
+                  "\t\treturn -EINVAL;\n"
+                  "\tif (mnt->mnt.mnt_flags & MNT_LOCKED)\n"
+                  "\t\treturn -EINVAL;\n"
+                  "\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n"
+                  "\t\treturn -EPERM;\n"
+                  "\treturn 0;\n"
+                  "}\n"
+              )
+              path_umount_fn = can_umount_fn + (
                   "\nint path_umount(struct path *path, int flags)\n"
                   "{\n"
                   "\tstruct mount *mnt = real_mount(path->mnt);\n"
@@ -1514,21 +1533,21 @@ jobs:
                   ih = read(internal_h)
                   if "path_umount" not in ih:
                       write(internal_h, ih + "\nextern int path_umount(struct path *path, int flags);\n")
-              print("[+] backported path_umount() to fs/namespace.c and fs/internal.h")
+              print("[+] backported can_umount() + path_umount() to fs/namespace.c and fs/internal.h")
 
 
-          def fix_sukisu_internal_susfs_declarations(root, susfs_h_path):
+          def fix_sukisu_internal_susfs_declarations(root):
               """
               In SukiSU-Ultra's unity build (`ksu_main.c`), `feature/adb_root.c` is included
               before `selinux/sepolicy.c`, and calls `susfs_add_sus_avd_allowed_by_type(...)`
               which is defined in `selinux/sepolicy.c` without a header prototype.
-              Extract the exact signature of any `susfs_*` function defined inside
-              `KernelSU/kernel/**/*.c` that lacks a `.h` prototype, and add its exact
-              forward declaration to `include/linux/susfs.h` (never overriding functions
-              already declared in `KernelSU/kernel/**/*.h` like `selinux.h`).
+              Inject its exact forward declaration into `KernelSU/kernel/selinux/selinux.h`
+              (NOT `include/linux/susfs.h`, so kernel files outside `KernelSU` never see
+              any `static` or internal KSU declarations).
               """
               ksu_dir = os.path.join(root, "KernelSU", "kernel")
-              if not os.path.isdir(ksu_dir):
+              selinux_h = os.path.join(ksu_dir, "selinux", "selinux.h")
+              if not os.path.isdir(ksu_dir) or not os.path.isfile(selinux_h):
                   return
               h_files = glob.glob(os.path.join(ksu_dir, "**/*.h"), recursive=True)
               c_files = glob.glob(os.path.join(ksu_dir, "**/*.c"), recursive=True)
@@ -1554,10 +1573,15 @@ jobs:
                       print(f"[+] extracted forward prototype from {os.path.relpath(cf, ksu_dir)}: {proto}")
 
               if forward_decls:
-                  h_text = read(susfs_h_path)
-                  block = "\n/* Forward declarations for SukiSU-Ultra unity build */\n" + "\n".join(forward_decls) + "\n"
-                  h_text = h_text.replace("#endif /* KSU_SUSFS_H */", block + "\n#endif /* KSU_SUSFS_H */")
-                  write(susfs_h_path, h_text)
+                  sh_text = read(selinux_h)
+                  block = "\n#ifdef CONFIG_KSU_SUSFS\n" + "\n".join(forward_decls) + "\n#endif\n"
+                  last_endif = sh_text.rfind("#endif")
+                  if last_endif >= 0:
+                      sh_text = sh_text[:last_endif] + block + sh_text[last_endif:]
+                  else:
+                      sh_text += block
+                  write(selinux_h, sh_text)
+                  print("[+] added forward declarations to KernelSU/kernel/selinux/selinux.h")
 
 
           def main():
@@ -1572,7 +1596,7 @@ jobs:
               print("[+] wrote include/linux/susfs_def.h, include/linux/susfs.h, fs/susfs.c")
 
               ensure_path_umount_in_namespace(root)
-              fix_sukisu_internal_susfs_declarations(root, susfs_h_path)
+              fix_sukisu_internal_susfs_declarations(root)
 
               # Wire fs/Makefile
               fs_mk = os.path.join(root, "fs/Makefile")
