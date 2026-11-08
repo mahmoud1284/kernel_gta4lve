@@ -254,6 +254,22 @@ jobs:
           if s.count("#include <linux/mount.h>") != 1:
               raise SystemExit("linux/mount.h include not found")
           mount_h.write_text(s.replace("#include <linux/mount.h>", "#include <linux/fs.h>", 1))
+
+          time_h = Path("KernelSU/kernel/preinit/runner/nolibc/time.h")
+          s = time_h.read_text()
+          marker = "#include <linux/time.h>\n"
+          compat = (marker
+                    "\n/* Linux 4.14 UAPI has no __kernel_timespec type. */\n"
+                    "#ifndef __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
+                    "#define __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
+                    "struct __kernel_timespec { __s64 tv_sec; long tv_nsec; };\n"
+                    "#endif\n")
+          if s.count(marker) != 1:
+              raise SystemExit("linux/time.h include not found")
+          if "struct __kernel_timespec {" not in s:
+              time_h.write_text(s.replace(marker, compat, 1))
+          else:
+              raise SystemExit("unexpected existing __kernel_timespec definition")
           PYFIX
           ! grep -RInE 'struct clone_args|__NR_clone3|<linux/mount.h>' KernelSU/kernel/preinit/runner/nolibc
           echo "compat patch applied"
