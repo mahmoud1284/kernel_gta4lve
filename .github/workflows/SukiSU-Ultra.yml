@@ -188,6 +188,11 @@ jobs:
           git -C KernelSU apply "$RUNNER_TEMP/sukisu-4.14-compat.patch"
           echo "compat patch applied"
 
+          # clang (-Werror) rejects two harmless things in SukiSU on this toolchain:
+          # 'KSU_NO_PREINIT' macro redefined, and unused variables in selinux/rules.c.
+          # Don't let warnings in the SukiSU driver fail the build.
+          printf '\nccflags-y += -Wno-error\n' >> KernelSU/kernel/Makefile
+
       - name: Apply SukiSU manual hooks
         if: ${{ inputs.enable_ksu }}
         run: |
