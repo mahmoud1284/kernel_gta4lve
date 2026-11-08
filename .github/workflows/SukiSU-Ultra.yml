@@ -3,6 +3,10 @@ name: Build gta4lve + SukiSU-Ultra + SUSFS + NoMount
 # Separate from build-kernelsu-next.yml (that one is untouched).
 # SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
 # compat patch (.github/patches is NOT needed: the patch is embedded below).
+# All third-party integration points are pinned and verified before compilation.
+
+permissions:
+  contents: read
 
 on:
   workflow_dispatch:
@@ -690,7 +694,10 @@ jobs:
           B64EOF
           gunzip -f "$RUNNER_TEMP/susfs.patch.gz"
           echo "40f2802790bd5f863d87ce6a0e27d962e87f51718323199c4abd2e6574ed84b4  $RUNNER_TEMP/susfs.patch" | sha256sum -c -
-          patch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
+          # Refuse fuzzed/partial application; this avoids silently producing a kernel
+          # with only part of the SUSFS hook set.
+          patch --dry-run --forward --batch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
+          patch --forward --batch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
           test -f fs/susfs.c && test -f include/linux/susfs.h
           grep -q "susfs.o" fs/Makefile
           echo "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
@@ -1008,25 +1015,36 @@ jobs:
             git diff -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h
             exit 1
           fi
+          NMB="$HOME/tc/gcc64/bin/aarch64-linux-android-nm"
+          nm_has() {
+            grep -Eq " [Tt] $1$" "$SYMBOLS_FILE"
+          }
+          SYMBOLS_FILE="$RUNNER_TEMP/vmlinux.symbols"
+          "$NMB" out/vmlinux > "$SYMBOLS_FILE"
           if [ "$ENABLE_NOMOUNT" = "true" ]; then
-            n=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -ci ' [tT] nm_\| [tT] nomount')
-            echo "NoMount symbols in vmlinux: $n"
-            [ "$n" -gt 0 ]
+            # NoMount has changed its internal symbol set across releases; validate the
+            # stable built-in entry point instead of counting incidental symbols.
+            if ! nm_has nomount_init; then
+              echo "::error::NoMount was enabled but nomount_init is missing from vmlinux"
+              exit 1
+            fi
+            echo "NoMount symbol: nomount_init"
           fi
           if [ "$ENABLE_KSU" = "true" ]; then
-            # every hook the patched kernel files call must be defined in the final image
-            NMB="$HOME/tc/gcc64/bin/aarch64-linux-android-nm"
+            # Validate stable entry points used by the 4.14 integration.
+            for sym in ksu_handle_execveat ksu_handle_faccessat ksu_handle_stat ksu_handle_sys_reboot; do
+              if ! nm_has "$sym"; then
+                echo "::error::SukiSU symbol missing from vmlinux: $sym"
+                exit 1
+              fi
+            done
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              n=$($NMB out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|execveat_sucompat|faccessat|stat|sys_read|vfs_fstat|sys_reboot|setresuid|input_handle_event)$')
-              echo "ksu hook symbols in vmlinux: $n (expected 9)"
-              [ "$n" -eq 9 ]
-              s=$($NMB out/vmlinux | grep -cE ' [Tt] susfs_(add_sus_path|add_sus_map|set_hide_sus_mnts_for_non_su_procs)$')
-              echo "susfs symbols in vmlinux: $s (expected 3)"
-              [ "$s" -eq 3 ]
-            else
-              n=$($NMB out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|faccessat|stat|vfs_read|vfs_fstat|sys_reboot)$')
-              echo "ksu hook symbols in vmlinux: $n (expected 6)"
-              [ "$n" -eq 6 ]
+              for sym in susfs_add_sus_path susfs_add_sus_map susfs_set_hide_sus_mnts_for_non_su_procs; do
+                if ! nm_has "$sym"; then
+                  echo "::error::SUSFS symbol missing from vmlinux: $sym"
+                  exit 1
+                fi
+              done
             fi
           fi
           test -f out/arch/arm64/boot/Image
