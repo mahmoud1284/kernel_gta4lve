@@ -702,6 +702,46 @@ jobs:
           grep -q "susfs.o" fs/Makefile
           echo "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
 
+      - name: Fix SUSFS C90 declaration order for Clang 4.14 build
+        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          from pathlib import Path
+
+          path = Path("fs/namei.c")
+          text = path.read_text()
+          old = """\tint open_flag = op->open_flag;
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          \tnd->state |= ND_STATE_OPEN_LAST;
+          #endif
+          \tbool will_truncate = (open_flag & O_TRUNC) != 0;
+          \tbool got_write = false;
+          \tint acc_mode = op->acc_mode;
+          \tunsigned seq;
+          \tstruct inode *inode;
+          \tstruct path path;
+          \tint error;
+          """
+          new = """\tint open_flag = op->open_flag;
+          \tbool will_truncate = (open_flag & O_TRUNC) != 0;
+          \tbool got_write = false;
+          \tint acc_mode = op->acc_mode;
+          \tunsigned seq;
+          \tstruct inode *inode;
+          \tstruct path path;
+          \tint error;
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          \tnd->state |= ND_STATE_OPEN_LAST;
+          #endif
+          """
+          if text.count(old) != 1:
+              raise SystemExit("unexpected fs/namei.c layout: C90 fix anchor not found exactly once")
+          path.write_text(text.replace(old, new, 1))
+          print("fixed fs/namei.c: declarations now precede SUSFS statement")
+          PYEOF
+          grep -A12 -B2 -n $'\tint open_flag = op->open_flag;' fs/namei.c | head -20
+
       - name: Apply SukiSU manual hooks (only when SUSFS is off)
         if: ${{ inputs.enable_ksu && !inputs.enable_susfs }}
         run: |
