@@ -1,22 +1,30 @@
-name: Build gta4lve + SukiSU-Ultra (Built-in KPM + SuSFS)
+name: Build gta4lve + SukiSU-Ultra
+
+# Separate from build-kernelsu-next.yml (that one is untouched).
+# SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
+# compat patch (.github/patches is NOT needed: the patch is embedded below).
 
 on:
   workflow_dispatch:
     inputs:
-      sukisu_ref:
-        description: "SukiSU-Ultra commit/tag/branch. Default = builtin"
+      suki_ref:
+        description: "SukiSU-Ultra commit (builtin branch). Default = the commit the 4.14 compat patch was written/tested against. Other commits may fail to patch"
         required: true
-        default: "builtin"
+        default: "1cfa57340590971cba7521ed536da8ebbedc5f0a"
       sublevel:
-        description: "Override SUBLEVEL in Makefile (e.g. 186 -> 4.14.186). Empty = keep source value"
+        description: "Override SUBLEVEL in Makefile (version string only, e.g. 186 -> 4.14.186). Empty = keep source value"
         required: false
         default: "186"
       force_module:
         description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
         type: boolean
         default: true
+      enable_kpm:
+        description: "CONFIG_KPM (SukiSU's built-in KPM bridge). NOTE: still needs KernelPatch patched into the boot image to actually load KPMs"
+        type: boolean
+        default: true
       enable_ksu:
-        description: "Integrate SukiSU-Ultra & SuSFS. Turn OFF to build a plain baseline kernel"
+        description: "Integrate SukiSU-Ultra. Turn OFF to build a plain baseline kernel (boot test)"
         type: boolean
         default: true
 
@@ -25,7 +33,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra, KPM, SuSFS, manual hooks)
+    name: Build kernel (SukiSU-Ultra, manual hooks)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -48,12 +56,10 @@ jobs:
           set -e
           mkdir -p "$HOME/tc/clang" "$HOME/tc/gcc64"
 
-          # GCC 4.9
           git clone --depth=1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
             "$HOME/tc/gcc64"
 
-          # AOSP clang r383902b
           got=0
           for ref in android11-release android11-qpr1-release android11-qpr2-release android11-qpr3-release android12-release mirror-goog-main-llvm-toolchain-source; do
             url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${ref}/clang-r383902b.tar.gz"
@@ -77,189 +83,311 @@ jobs:
           "$HOME/tc/clang/bin/clang" --version | head -1
           echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Integrate SukiSU-Ultra & SuSFS
+      - name: Integrate SukiSU-Ultra
         if: ${{ inputs.enable_ksu }}
         env:
-          SUKISU_REF: ${{ inputs.sukisu_ref }}
+          SUKI_REF: ${{ inputs.suki_ref }}
         run: |
           set -e
-          echo "Cloning SukiSU-Ultra using official instructions..."
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s "${SUKISU_REF}"
-          
-          KSU_DIR=$(find . -maxdepth 1 -type d -iname "*SU*" | head -n 1)
-          echo "Found SukiSU directory at: $KSU_DIR"
-          
-          test -L drivers/kernelsu || test -L drivers/sukisu
-          
-          # Fix Samsung Logo bootloop (drop seccomp atomic_t filter_count patch)
-          if [ -f "$KSU_DIR/kernel/Kbuild" ]; then
-            echo "Dropping seccomp patch from $KSU_DIR/kernel/Kbuild to prevent CRC mismatch..."
-            sed -i '/^ifneq .*atomic_t filter_count;/,/^endif/d' "$KSU_DIR/kernel/Kbuild"
-          fi
+          # setup.sh clones SukiSU-Ultra into ./KernelSU, checks out $SUKI_REF,
+          # symlinks drivers/kernelsu and wires drivers/Makefile + drivers/Kconfig.
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKI_REF}/kernel/setup.sh" \
+            | bash -s "${SUKI_REF}"
+          test -L drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile
+          grep -q "kernelsu/Kconfig" drivers/Kconfig
+          echo "SukiSU-Ultra commit: $(git -C KernelSU rev-parse HEAD)"
 
-          # Backport set_memory.h for kernel 4.14 (Required by SukiSU KPM)
-          echo "Backporting set_memory.h from Linux 4.19..."
-          curl -LSs "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/set_memory.h?h=linux-4.19.y" -o include/linux/set_memory.h
-          echo "set_memory.h backport completed."
-          
-          # FIX for 'linux/static_call.h file not found' on 4.14
-          echo "Creating dummy static_call.h..."
-          mkdir -p include/linux
-          cat << 'EOF' > include/linux/static_call.h
-          #ifndef _LINUX_STATIC_CALL_H
-          #define _LINUX_STATIC_CALL_H
-          #include <linux/types.h>
-          #define DECLARE_STATIC_CALL(name, func)
-          #define DEFINE_STATIC_CALL(name, func)
-          #define DEFINE_STATIC_CALL_NULL(name, typename)
-          #define static_call(name) (name)
-          #define static_call_cond(name) (name)
-          #define static_call_update(name, func) do {} while (0)
-          #endif
-          EOF
-          
-          # FULL SUSFS INTEGRATION (Bulletproof copy)
-          echo "Downloading SuSFS from simonpunk repo..."
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git
-          
-          echo "Copying SuSFS headers and source..."
-          cp susfs4ksu/kernel_patches/include/linux/susfs*.h include/linux/ 2>/dev/null || true
-          cp susfs4ksu/kernel_patches/fs/sus*.c fs/ 2>/dev/null || true
-          
-          # Ensure mandatory headers exist for SukiSU compilation
-          if [ ! -f "include/linux/susfs.h" ]; then
-            echo "Creating dummy susfs.h..."
-            cat << 'EOF' > include/linux/susfs.h
-          #ifndef _LINUX_SUSFS_H
-          #define _LINUX_SUSFS_H
-          #endif
-          EOF
+          # --- 4.14 compat patch (static_call.h, cpu_spoof/vdso, access_ok, kvcalloc, SUSFS-only call) ---
+          cat > "$RUNNER_TEMP/sukisu-4.14-compat.patch" <<'PATCHEOF'
+          diff --git a/kernel/extension/kpm/kpm.c b/kernel/extension/kpm/kpm.c
+          index 5735c2d3..b7debdf4 100644
+          --- a/kernel/extension/kpm/kpm.c
+          +++ b/kernel/extension/kpm/kpm.c
+          @@ -179,7 +179,7 @@ int do_kpm(void __user *arg)
+               int result;
+               /* Called only through the manager_or_root-authorized extension ioctl. */
+               if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
+          -    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
+          +    if (!ksu_access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
+               result = handle_kpm(&cmd);
+               return copy_to_user(u64_to_user_ptr(cmd.result_code), &result, sizeof(result)) ? -EFAULT : 0;
+           }
+          diff --git a/kernel/kernel_includes.h b/kernel/kernel_includes.h
+          index 422fde3d..a5168fa1 100644
+          --- a/kernel/kernel_includes.h
+          +++ b/kernel/kernel_includes.h
+          @@ -73,7 +73,9 @@
+           #include <linux/vmalloc.h>
+           #include <linux/tty.h>
+           #include <linux/kref.h>
+          +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+           #include <linux/static_call.h>
+          +#endif
+           #include "arch.h"
+           #ifdef CONFIG_KSU_SUSFS
+           #include <linux/susfs.h>
+          diff --git a/kernel/ksu_main.c b/kernel/ksu_main.c
+          index 8b1272d5..a55df22f 100644
+          --- a/kernel/ksu_main.c
+          +++ b/kernel/ksu_main.c
+          @@ -77,7 +77,8 @@
+           
+           // unity build
+           #include "extension/extension.c"
+          -#include "extension/cpu_spoof.c"
+          +/* 4.14: cpu_spoof needs vdso/datapage.h (5.x only); not needed for root/KPM -> stub */
+          +int ksu_extension_cpu_spoof_io(u32 id, void __user *raw) { return -EOPNOTSUPP; }
+           #include "extension/umount_paths.c"
+           #include "extension/dynamic_manager.c"
+           #include "extension/kpm.c"
+          diff --git a/kernel/manager/pkg_observer.c b/kernel/manager/pkg_observer.c
+          index 9082a6de..acbd8deb 100644
+          --- a/kernel/manager/pkg_observer.c
+          +++ b/kernel/manager/pkg_observer.c
+          @@ -21,7 +21,9 @@ static void ksu_track_throne_tw_func(struct callback_head *cb)
+                   return;
+               track_throne(false);
+               // Renew the priority uid bitmap filter
+          +#ifdef CONFIG_KSU_SUSFS
+               susfs_parse_priority_app_strings();
+          +#endif
+           }
+           
+           // Never scan from the fsnotify handler: fsnotify_mark_srcu and the rename's dir
+          @@ -34,7 +36,9 @@ static void ksu_defer_track_throne(void)
+               struct callback_head *cb;
+           
+               // Renew the getpriority uid bitmap filter
+          +#ifdef CONFIG_KSU_SUSFS
+               susfs_parse_priority_app_strings();
+          +#endif
+           
+               if (!(current->flags & PF_KTHREAD)) {
+                   cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+          diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+          index 9a94512b..8ea2eb5e 100644
+          --- a/kernel/supercall/dispatch.c
+          +++ b/kernel/supercall/dispatch.c
+          @@ -619,8 +619,8 @@ static int do_lookup_symbols(void __user *arg)
+               if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
+                   return -EINVAL;
+           
+          -    names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
+          -    addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
+          +    names = kvzalloc(cmd.count * sizeof(*names), GFP_KERNEL);
+          +    addrs = kvzalloc(cmd.count * sizeof(*addrs), GFP_KERNEL);
+               if (!names || !addrs) {
+                   ret = -ENOMEM;
+                   goto out;
+          PATCHEOF
+          if ! git -C KernelSU apply --check "$RUNNER_TEMP/sukisu-4.14-compat.patch"; then
+            echo "::error::4.14 compat patch does not apply to SukiSU commit ${SUKI_REF}. Use the default pinned commit."
+            exit 1
           fi
-          
-          if [ ! -f "include/linux/susfs_def.h" ]; then
-            echo "Creating dummy susfs_def.h..."
-            cat << 'EOF' > include/linux/susfs_def.h
-          #ifndef _LINUX_SUSFS_DEF_H
-          #define _LINUX_SUSFS_DEF_H
-          #endif
-          EOF
-          fi
-          
-          echo "Adding SuSFS to fs/Makefile..."
-          if [ -f "fs/susfs.c" ] && ! grep -q "susfs.o" fs/Makefile; then
-            echo "obj-y += susfs.o" >> fs/Makefile
-          fi
-          if [ -f "fs/sus_su.c" ] && ! grep -q "sus_su.o" fs/Makefile; then
-            echo "obj-y += sus_su.o" >> fs/Makefile
-          fi
-          
-          echo "SuSFS integration step completed!"
+          git -C KernelSU apply "$RUNNER_TEMP/sukisu-4.14-compat.patch"
+          echo "compat patch applied"
 
-      - name: Apply Manual Hooks
+      - name: Apply SukiSU manual hooks
         if: ${{ inputs.enable_ksu }}
         run: |
-          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" << 'PYEOF'
+          cat > "$RUNNER_TEMP/ksu_manual_hooks_suki.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Apply SukiSU-Ultra (`builtin` branch) *manual hooks* to a Linux 4.14 arm64 kernel tree.
+
+          Usage:  python3 ksu_manual_hooks_suki.py <kernel-root>
+
+          - Idempotent: running it twice changes nothing the second time.
+          - Strict: if an anchor is not found (source drifted) it exits with an error instead of
+            silently producing a kernel without a hook.
+          - Every call is wrapped in `#ifdef CONFIG_KSU`, so CONFIG_KSU=n gives the stock kernel.
+          - Setuid / umount handling is done by SukiSU through an LSM hook, so no kernel patch is
+            needed for those. SUSFS is NOT supported here (it needs a large kernel patch set).
+          """
           import os
+          import re
           import sys
 
           HEADER_PATH = "include/linux/ksu_hooks.h"
           HEADER = r"""/* SPDX-License-Identifier: GPL-2.0 */
           #ifndef _LINUX_KSU_HOOKS_H
           #define _LINUX_KSU_HOOKS_H
+
           #include <linux/types.h>
           #include <linux/compiler.h>
+
           struct filename;
           struct file;
-          struct stat;
+
           #ifdef CONFIG_KSU
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
-          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
-          extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
-          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-          #endif
-          #endif
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          			       void *argv, void *envp, int *flags);
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          				int *mode, int *__unused_flags);
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+          			   int *flags);
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+          			       size_t *count_ptr, loff_t **pos);
+          extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+          				 void __user **arg);
+          #endif /* CONFIG_KSU */
+
+          #endif /* _LINUX_KSU_HOOKS_H */
           """
+
           INCLUDE_LINE = "#include <linux/ksu_hooks.h>\n"
 
+          # (file, function signature, anchor, mode, hook call text)
           HOOKS = [
-              ("fs/exec.c", "static int do_execveat_common(int fd, struct filename *filename,", "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n", "after", "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
-              ("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)", "\tif (mode & ~S_IRWXO)", "before", "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
-              ("fs/stat.c", "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,", "\terror = vfs_fstatat(dfd, filename, &stat, flag);", "before", "ksu_handle_stat(&dfd, &filename, &flag);"),
-              ("fs/stat.c", "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)", "\treturn error;", "before", "ksu_handle_newfstat_ret(&fd, &statbuf);"),
-              ("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)", "\tif (!(file->f_mode & FMODE_READ))", "before", "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
-              ("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,", "\t/* We only trust the superuser with rebooting the system. */", "before", "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
-              ("drivers/input/input.c", "void input_event(struct input_dev *dev,", "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {", "before", "ksu_handle_input_handle_event(&type, &code, &value);"),
+              ("fs/exec.c",
+               "static int do_execveat_common(int fd, struct filename *filename,",
+               "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n",
+               "after",
+               "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
+
+              ("fs/open.c",
+               "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+               "\tif (mode & ~S_IRWXO)",
+               "before",
+               "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+               "\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+               "before",
+               "ksu_handle_stat(&dfd, &filename, &flag);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)",
+               "\tif (!error)\n\t\terror = cp_new_stat(&stat, statbuf);",
+               "before",
+               "if (!error)\n\t\tksu_handle_vfs_fstat(fd, &stat.size);"),
+
+              ("fs/read_write.c",
+               "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)",
+               "\tif (!(file->f_mode & FMODE_READ))",
+               "before",
+               "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
+
+              ("kernel/reboot.c",
+               "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+               "\t/* We only trust the superuser with rebooting the system. */",
+               "before",
+               "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
           ]
+
 
           def die(msg):
               print("ERROR: " + msg, file=sys.stderr)
               sys.exit(1)
 
+
           def read(path):
-              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f: return f.read()
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
 
           def write(path, text):
-              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(text)
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(text)
+
 
           def ensure_include(root, rel):
               path = os.path.join(root, rel)
               text = read(path)
-              if INCLUDE_LINE in text: return False
+              if INCLUDE_LINE in text:
+                  return False
               idx = text.find("\n#include ")
-              if idx < 0: die("%s: no #include line found" % rel)
+              if idx < 0:
+                  die("%s: no #include line found" % rel)
               idx += 1
               eol = text.find("\n", idx) + 1
               write(path, text[:eol] + INCLUDE_LINE + text[eol:])
               return True
 
+
           def apply_hook(root, rel, func_sig, anchor, mode, call):
               path = os.path.join(root, rel)
               text = read(path)
-              if text.count(func_sig) != 1: die("%s: function sig found %d times:\n  %s" % (rel, text.count(func_sig), func_sig))
+
+              if text.count(func_sig) != 1:
+                  die("%s: function signature found %d times (expected 1):\n  %s"
+                      % (rel, text.count(func_sig), func_sig))
               start = text.index(func_sig)
               end = text.find("\n}\n", start)
-              if end < 0: die("%s: end not found: %s" % (rel, func_sig))
-              body = text[start:end]
-              if call in body: return False
+              if end < 0:
+                  die("%s: end of function not found: %s" % (rel, func_sig))
+
+              if call in text[start:end]:
+                  return False  # already patched
+
               a = text.find(anchor, start)
-              if a < 0 or a > end: die("%s: anchor not found:\n  %s\n  anchor: %r" % (rel, func_sig, anchor))
+              if a < 0 or a > end:
+                  die("%s: anchor not found inside function:\n  %s\n  anchor: %r"
+                      % (rel, func_sig, anchor))
+
               block = "#ifdef CONFIG_KSU\n\t%s\n#endif\n" % call
               pos = a if mode == "before" else a + len(anchor)
               write(path, text[:pos] + block + text[pos:])
               return True
 
+
           def main():
+              if len(sys.argv) != 2:
+                  die("usage: ksu_manual_hooks_suki.py <kernel-root>")
               root = os.path.abspath(sys.argv[1])
+              if not os.path.isfile(os.path.join(root, "Makefile")):
+                  die("%s does not look like a kernel tree" % root)
+
               hdr = os.path.join(root, HEADER_PATH)
-              if not os.path.isfile(hdr) or read(hdr) != HEADER: write(hdr, HEADER)
-              for rel in sorted({h[0] for h in HOOKS}): ensure_include(root, rel)
-              for rel, func_sig, anchor, mode, call in HOOKS: apply_hook(root, rel, func_sig, anchor, mode, call)
+              if not os.path.isfile(hdr) or read(hdr) != HEADER:
+                  write(hdr, HEADER)
+                  print("[+] wrote " + HEADER_PATH)
+              else:
+                  print("[=] " + HEADER_PATH + " already present")
+
+              for rel in sorted({h[0] for h in HOOKS}):
+                  if ensure_include(root, rel):
+                      print("[+] %s: added #include <linux/ksu_hooks.h>" % rel)
+
+              for rel, func_sig, anchor, mode, call in HOOKS:
+                  name = re.search(r"ksu_[a-z_]+", call).group(0)
+                  if apply_hook(root, rel, func_sig, anchor, mode, call):
+                      print("[+] %s: hooked %s" % (rel, name))
+                  else:
+                      print("[=] %s: %s already hooked" % (rel, name))
+
+              print("[+] done")
+
 
           if __name__ == "__main__":
               main()
           PYEOF
-          python3 -I "$RUNNER_TEMP/ksu_manual_hooks.py" .
+          python3 -I "$RUNNER_TEMP/ksu_manual_hooks_suki.py" .
 
-      - name: Override kernel version string
+      - name: Override kernel version string (optional)
         if: ${{ inputs.sublevel != '' }}
         env:
           SUBLEVEL_NEW: ${{ inputs.sublevel }}
         run: |
+          set -e
+          echo "Before: $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_NEW}/" Makefile
+          echo "After:  $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
 
       - name: Configure
         env:
           FORCE_MODULE: ${{ inputs.force_module }}
           ENABLE_KSU: ${{ inputs.enable_ksu }}
+          ENABLE_KPM: ${{ inputs.enable_kpm }}
         run: |
           set -e
           export BSP_BUILD_FAMILY=qogirl6
           export BSP_BUILD_ANDROID_OS=y
           export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+          # DTC_OVERLAY_VTS_EXT intentionally NOT set (tools/lib64/*.so are Git LFS pointers).
 
           {
             echo "BSP_BUILD_FAMILY=qogirl6"
@@ -273,19 +401,42 @@ jobs:
           $KMAKE "$DEFCONFIG"
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            scripts/config --file out/.config -e KSU -e KPM -e KALLSYMS -e KALLSYMS_ALL -e KSU_SUSFS -e KSU_SUSFS_SUS_SU -e KSU_SUSFS_INLINE_HOOK
+            # SUSFS needs a big kernel patch set that this tree does not have -> must be OFF
+            scripts/config --file out/.config -e KSU -d KSU_SUSFS
+            if [ "$ENABLE_KPM" = "true" ]; then
+              scripts/config --file out/.config -e KPM
+            else
+              scripts/config --file out/.config -d KPM
+            fi
           fi
           if [ "$FORCE_MODULE" = "true" ]; then
             scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
           fi
           $KMAKE olddefconfig
 
-          # Check mandatory built-in configs
+          echo "---- resulting config ----"
+          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
+
           if [ "$ENABLE_KSU" = "true" ]; then
-            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU=y is missing"; exit 1; }
-            grep -q '^CONFIG_KPM=y' out/.config || { echo "::error::CONFIG_KPM=y is missing. SukiSU-Ultra requires it built-in."; exit 1; }
-            grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config || { echo "::error::CONFIG_KALLSYMS_ALL=y is missing"; exit 1; }
+            grep -q '^CONFIG_KSU=y' out/.config
+            if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+              echo "::error::KSU_SUSFS is enabled but the kernel has no SUSFS patches"; exit 1
+            fi
+            if [ "$ENABLE_KPM" = "true" ]; then grep -q '^CONFIG_KPM=y' out/.config; fi
           fi
+          if [ "$FORCE_MODULE" = "true" ]; then
+            grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
+          fi
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
+
+      - name: Pre-generate include/generated/compile.h
+        if: ${{ inputs.enable_ksu }}
+        run: |
+          # SukiSU includes generated/compile.h; generate it before the parallel build so
+          # the driver cannot race ahead of it.
+          $KMAKE init/version.o
+          test -f out/include/generated/compile.h
 
       - name: Build kernel
         run: |
@@ -301,15 +452,26 @@ jobs:
           n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* " build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
 
       - name: Collect output
+        env:
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
         run: |
           set -e
+          # SukiSU must not change struct layouts (would break stock vendor modules via modversions)
           if ! git diff --quiet -- include/linux/seccomp.h; then
             echo "::error::include/linux/seccomp.h was modified (struct layout changed)"
+            git diff -- include/linux/seccomp.h
             exit 1
+          fi
+          if [ "$ENABLE_KSU" = "true" ]; then
+            # every hook the patched kernel files call must be defined in the final image
+            n=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|faccessat|stat|vfs_read|vfs_fstat|sys_reboot)$')
+            echo "ksu hook symbols in vmlinux: $n (expected 6)"
+            [ "$n" -eq 6 ]
           fi
           test -f out/arch/arm64/boot/Image
           mkdir -p dist
           cp out/arch/arm64/boot/Image dist/Image
+          echo "Kernel release: $(cat out/include/config/kernel.release)"
           echo "KSU_REL=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3 zip
@@ -319,9 +481,10 @@ jobs:
           rm -rf ak3/.git ak3/.github ak3/README.md
           cp dist/Image ak3/Image
           sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SuSFS/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra/' ak3/anykernel.sh
           sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
-          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-Ultra-${KSU_REL}.zip" . -x '*.git*')
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
+          ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -334,6 +497,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-sukisu
           path: build.log
           if-no-files-found: ignore
