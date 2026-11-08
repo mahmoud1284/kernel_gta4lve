@@ -248,13 +248,55 @@ jobs:
           else
             echo "git apply check failed, falling back to patch utility..."
             patch -p1 --forward < "$PATCH_FILE" || {
-              echo "::warning::Some hunks failed to apply cleanly. Listing .rej files if any:"
+              echo "::warning::Some hunks were rejected by patch. Resolving known rejects..."
               find . -name "*.rej" -exec echo "Rejection in: {}" \; -exec cat {} \;
             }
           fi
 
+          # === Fix missing SuSFS header includes in rejected OEM files (e.g. fs/namei.c) ===
+          python3 - <<'PYEOF'
+          import os
+
+          target_files = [
+              "fs/namei.c",
+              "fs/open.c",
+              "fs/stat.c",
+              "fs/namespace.c",
+              "fs/proc_namespace.c",
+              "fs/readdir.c",
+              "fs/read_write.c",
+          ]
+
+          has_susfs_def = os.path.isfile("include/linux/susfs_def.h")
+          inc_code = "\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n"
+          if has_susfs_def:
+              inc_code += "#include <linux/susfs_def.h>\n"
+          inc_code += "#endif\n"
+
+          for fpath in target_files:
+              if not os.path.isfile(fpath):
+                  continue
+              with open(fpath, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  content = f.read()
+
+              # If file uses SuSFS symbols or has been patched by SuSFS, ensure susfs.h is included
+              if "susfs" in content.lower() or "inode_state_sus" in content.lower() or "susfs_task_state" in content:
+                  if "#include <linux/susfs.h>" not in content:
+                      idx = content.find("\n#include ")
+                      if idx >= 0:
+                          eol = content.find("\n", idx + 1) + 1
+                          content = content[:eol] + inc_code + content[eol:]
+                          with open(fpath, "w", encoding="utf-8", errors="surrogateescape") as f:
+                              f.write(content)
+                          print(f"[+] Successfully injected <linux/susfs.h> into {fpath}")
+                      else:
+                          print(f"[!] Could not find #include anchor in {fpath}")
+                  else:
+                      print(f"[=] {fpath} already includes susfs.h")
+          PYEOF
+
           test -f include/linux/susfs.h
-          echo "SuSFS integration completed."
+          echo "SuSFS integration and header checks completed."
 
       - name: Integrate NoMount (VFS path redirection)
         if: ${{ inputs.enable_nomount }}
