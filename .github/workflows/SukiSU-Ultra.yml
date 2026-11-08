@@ -237,16 +237,16 @@ jobs:
           from pathlib import Path
           sys_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys.h")
           s = sys_h.read_text()
-          marker = "\t * clone() could be used but has different argument orders per\n"
-          start = s.index(marker, s.index("pid_t sys_vfork(void)")) - len("\t/*\n")
-          end_marker = "\t\treturn my_syscall2(__NR_clone3, &args, sizeof(args));"
-          end = s.index(end_marker, start) + len(end_marker)
-          replacement = ("\t\t/* Linux 4.14 has clone() but not clone3(). */\n"
+          fn_start = s.index("pid_t sys_vfork(void)")
+          start = s.index("/*", fn_start)
+          end_call = s.index("my_syscall2(__NR_clone3", start)
+          end = s.index("\n", end_call)
+          replacement = ("\t/* Linux 4.14 has clone() but not clone3(). */\n"
                          "#if defined(__NR_clone)\n"
-                         "\t\treturn my_syscall5(__NR_clone,\n"
-                         "\t\t\tCLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0);\n"
+                         "\treturn my_syscall5(__NR_clone,\n"
+                         "\t\tCLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0);\n"
                          "#else\n"
-                         "\t\treturn -ENOSYS;\n"
+                         "\treturn -ENOSYS;\n"
                          "#endif")
           sys_h.write_text(s[:start] + replacement + s[end:])
           mount_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys/mount.h")
@@ -974,6 +974,11 @@ jobs:
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_NEW}/" Makefile
           echo "After:  $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
 
+      - name: Initialize build log
+        run: |
+          : > build.log
+          echo "Build log initialized at $(date -u +%FT%TZ)"
+
       - name: Configure
         env:
           FORCE_MODULE: ${{ inputs.force_module }}
@@ -983,6 +988,8 @@ jobs:
           ENABLE_SUSFS: ${{ inputs.enable_susfs }}
         run: |
           set -e
+          # Capture configuration/preparation failures too; Build kernel may not run.
+          exec > >(tee -a build.log) 2>&1
           export BSP_BUILD_FAMILY=qogirl6
           export BSP_BUILD_ANDROID_OS=y
           export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
@@ -1068,9 +1075,11 @@ jobs:
       - name: Pre-generate include/generated/compile.h
         if: ${{ inputs.enable_ksu }}
         run: |
+          set -o pipefail
           # SukiSU includes generated/compile.h; generate it before the parallel build so
-          # the driver cannot race ahead of it.
-          $KMAKE init/version.o
+          # the driver cannot race ahead of it. Keep this output in the diagnostic log;
+          # this step runs before the main Build kernel step.
+          $KMAKE init/version.o 2>&1 | tee -a build.log
           test -f out/include/generated/compile.h
 
       - name: Build kernel
@@ -1082,9 +1091,13 @@ jobs:
         if: failure()
         run: |
           echo "=== first errors in build.log ==="
-          grep -n -E "error:|Error [0-9]|undefined reference|No hooks|fatal|\*\*\*" build.log | head -40 || true
-          echo "=== 15 lines before the first make error ==="
-          n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* " build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
+          if [ -s build.log ]; then
+            grep -n -E "error:|Error [0-9]|undefined reference|No hooks|fatal|\*\*\*|No such file" build.log | head -40 || true
+            echo "=== 15 lines before the first make error ==="
+            n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* |No such file" build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
+          else
+            echo "build.log is empty; failure occurred before a logged build command."
+          fi
 
       - name: Collect output
         env:
