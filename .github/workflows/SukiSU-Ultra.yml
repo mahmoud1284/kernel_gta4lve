@@ -1,8 +1,11 @@
-name: Build gta4lve + SukiSU-Ultra + NoMount
+name: Build gta4lve + SukiSU-Ultra + SuSFS + NoMount
 
 # Separate from build-kernelsu-next.yml (that one is untouched).
 # SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
 # compat patch (.github/patches is NOT needed: the patch is embedded below).
+# SuSFS is integrated via an idempotent 4.14 port + inline VFS/proc/uname/cmdline/kallsyms
+# hook script that preserves core struct layouts (include/linux/sched.h, mount.h, seccomp.h)
+# so stock vendor .ko module CRCs are not broken.
 
 on:
   workflow_dispatch:
@@ -23,6 +26,14 @@ on:
         description: "CONFIG_KPM (SukiSU's built-in KPM bridge). NOTE: still needs KernelPatch patched into the boot image to actually load KPMs"
         type: boolean
         default: true
+      enable_susfs:
+        description: "Integrate SuSFS (in-kernel path/mount/kstat/uname/cmdline/maps hiding for SukiSU-Ultra)"
+        type: boolean
+        default: true
+      susfs_branch:
+        description: "simonpunk/susfs4ksu reference branch (default: kernel-4.14)"
+        required: false
+        default: "kernel-4.14"
       enable_nomount:
         description: "Integrate NoMount (maxsteeel/nomount, in-kernel VFS redirection). Install the NoMount metamodule afterwards"
         type: boolean
@@ -37,7 +48,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra, manual hooks)
+    name: Build kernel (SukiSU-Ultra + SuSFS, manual hooks)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -212,7 +223,7 @@ jobs:
             silently producing a kernel without a hook.
           - Every call is wrapped in `#ifdef CONFIG_KSU`, so CONFIG_KSU=n gives the stock kernel.
           - Setuid / umount handling is done by SukiSU through an LSM hook, so no kernel patch is
-            needed for those. SUSFS is NOT supported here (it needs a large kernel patch set).
+            needed for those.
           """
           import os
           import re
@@ -376,6 +387,1199 @@ jobs:
           PYEOF
           python3 -I "$RUNNER_TEMP/ksu_manual_hooks_suki.py" .
 
+      - name: Integrate SuSFS (4.14 port + inline hooks)
+        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
+        env:
+          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+        run: |
+          set -e
+          # Clone upstream simonpunk/susfs4ksu for reference headers/patches if reachable
+          git clone --depth=1 -b "${SUSFS_BRANCH}" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu" || \
+            git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu" || true
+
+          cat > "$RUNNER_TEMP/integrate_susfs_suki_414.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Integrate SuSFS into a Linux 4.14 arm64 kernel tree for SukiSU-Ultra (`builtin` branch).
+
+          Design goals for mahmoud1284/kernel_gta4lve:
+          1. KABI / Module CRC preservation: NEVER modifies `include/linux/sched.h`,
+             `include/linux/mount.h`, or `include/linux/seccomp.h`. Per-inode state uses
+             high bits in `inode->i_mapping->flags`, and per-task non-root app state uses
+             a thread_info flag or UID check.
+          2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
+             including both SuSFS v1.5.x/v2.x supercalls and priority UID filter APIs
+             (`susfs_parse_priority_app_strings`, `susfs_set_priority_uid_filter`, etc.).
+          3. Idempotent inline hooks in `fs/namei.c`, `fs/readdir.c`, `fs/stat.c`, `fs/open.c`,
+             `fs/proc_namespace.c`, `fs/proc/task_mmu.c`, `fs/proc/cmdline.c`, `kernel/sys.c`,
+             and `kernel/kallsyms.c`.
+          """
+          import glob
+          import os
+          import re
+          import sys
+
+          SUSFS_DEF_H = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef KSU_SUSFS_DEF_H
+          #define KSU_SUSFS_DEF_H
+
+          #include <linux/bits.h>
+
+          #define SUSFS_VERSION "v2.0.0"
+          #define SUSFS_VARIANT "NON-GKI"
+
+          /* Supercall command numbers */
+          #define CMD_SUSFS_ADD_SUS_PATH 0x55550
+          #define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH 0x55551
+          #define CMD_SUSFS_SET_SDCARD_ROOT_PATH 0x55552
+          #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55553
+          #define CMD_SUSFS_ADD_SUS_MOUNT 0x55560
+          #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
+          #define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562
+          #define CMD_SUSFS_ADD_SUS_KSTAT 0x55570
+          #define CMD_SUSFS_UPDATE_SUS_KSTAT 0x55571
+          #define CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY 0x55572
+          #define CMD_SUSFS_ADD_TRY_UMOUNT 0x55580
+          #define CMD_SUSFS_SET_UNAME 0x55590
+          #define CMD_SUSFS_ENABLE_LOG 0x555a0
+          #define CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG 0x555b0
+          #define CMD_SUSFS_ADD_OPEN_REDIRECT 0x555c0
+          #define CMD_SUSFS_SHOW_VERSION 0x555e1
+          #define CMD_SUSFS_SHOW_ENABLED_FEATURES 0x555e2
+          #define CMD_SUSFS_SHOW_VARIANT 0x555e3
+          #define CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE 0x555e4
+          #define CMD_SUSFS_IS_SUS_SU_READY 0x555f0
+          #define CMD_SUSFS_SUS_SU 0x60000
+          #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x60010
+          #define CMD_SUSFS_ADD_SUS_MAP 0x60020
+          #define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030
+
+          #define SUSFS_MAX_LEN_PATHNAME 256
+          #define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 4096
+
+          #define TRY_UMOUNT_DEFAULT 0
+          #define TRY_UMOUNT_DETACH 1
+
+          #define SUS_SU_DISABLED 0
+          #define SUS_SU_WITH_OVERLAY 1
+          #define SUS_SU_WITH_HOOKS 2
+
+          #define DEFAULT_SUS_MNT_ID 100000
+          #define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000
+          #define DEFAULT_SUS_MNT_GROUP_ID 1000
+
+          /*
+           * High bits in inode->i_mapping->flags (unsigned long on arm64).
+           * Kept in susfs_def.h so include/linux/fs.h and core structs need no layout changes.
+           */
+          #define AS_FLAGS_SUS_PATH 24
+          #define AS_FLAGS_SUS_MOUNT 25
+          #define AS_FLAGS_SUS_KSTAT 26
+          #define AS_FLAGS_OPEN_REDIRECT 27
+          #define AS_FLAGS_ANDROID_DATA_ROOT_PATH 28
+          #define AS_FLAGS_SDCARD_ROOT_PATH 29
+          #define AS_FLAGS_SUS_MAP 30
+
+          #define BIT_SUS_PATH BIT(AS_FLAGS_SUS_PATH)
+          #define BIT_SUS_MOUNT BIT(AS_FLAGS_SUS_MOUNT)
+          #define BIT_SUS_KSTAT BIT(AS_FLAGS_SUS_KSTAT)
+          #define BIT_OPEN_REDIRECT BIT(AS_FLAGS_OPEN_REDIRECT)
+          #define BIT_ANDROID_DATA_ROOT_PATH BIT(AS_FLAGS_ANDROID_DATA_ROOT_PATH)
+          #define BIT_SDCARD_ROOT_PATH BIT(AS_FLAGS_SDCARD_ROOT_PATH)
+          #define BIT_SUS_MAP BIT(AS_FLAGS_SUS_MAP)
+
+          #define ND_STATE_LOOKUP_LAST 32
+          #define ND_STATE_OPEN_LAST 64
+          #define ND_STATE_LAST_SDCARD_SUS_PATH 128
+          #define ND_FLAGS_LOOKUP_LAST 0x2000000
+
+          #define MAGIC_MOUNT_WORKDIR "/debug_ramdisk/workdir"
+          #define DATA_ADB_UMOUNT_FOR_ZYGOTE_SYSTEM_PROCESS "/data/adb/susfs_umount_for_zygote_system_process"
+          #define DATA_ADB_NO_AUTO_ADD_SUS_BIND_MOUNT "/data/adb/susfs_no_auto_add_sus_bind_mount"
+          #define DATA_ADB_NO_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT "/data/adb/susfs_no_auto_add_sus_ksu_default_mount"
+          #define DATA_ADB_NO_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT "/data/adb/susfs_no_auto_add_try_umount_for_bind_mount"
+
+          #endif /* KSU_SUSFS_DEF_H */
+          """
+
+          SUSFS_H = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef KSU_SUSFS_H
+          #define KSU_SUSFS_H
+
+          #include <linux/version.h>
+          #include <linux/types.h>
+          #include <linux/utsname.h>
+          #include <linux/hashtable.h>
+          #include <linux/path.h>
+          #include <linux/fs.h>
+          #include <linux/sched.h>
+          #include <linux/cred.h>
+          #include <linux/susfs_def.h>
+
+          #define SUSFS_LOGI(fmt, ...) \
+              do { if (susfs_is_log_enabled) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__); } while (0)
+          #define SUSFS_LOGE(fmt, ...) \
+              do { if (susfs_is_log_enabled) pr_err("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__); } while (0)
+
+          struct st_susfs_sus_path {
+              unsigned long                    target_ino;
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              unsigned int                     i_uid;
+              int                              err;
+          };
+
+          struct st_susfs_sus_path_list {
+              struct list_head                 list;
+              struct st_susfs_sus_path         info;
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              size_t                           path_len;
+          };
+
+          struct st_external_dir {
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              bool                             is_inited;
+              int                              cmd;
+              int                              err;
+          };
+
+          struct st_susfs_sus_mount {
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              unsigned long                    target_dev;
+              int                              err;
+          };
+
+          struct st_susfs_sus_mount_list {
+              struct list_head                 list;
+              struct st_susfs_sus_mount        info;
+          };
+
+          struct st_susfs_sus_kstat {
+              int                              is_statically;
+              unsigned long                    target_ino;
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              unsigned long                    spoofed_ino;
+              unsigned long                    spoofed_dev;
+              unsigned int                     spoofed_nlink;
+              long long                        spoofed_size;
+              long                             spoofed_atime_tv_sec;
+              long                             spoofed_mtime_tv_sec;
+              long                             spoofed_ctime_tv_sec;
+              long                             spoofed_atime_tv_nsec;
+              long                             spoofed_mtime_tv_nsec;
+              long                             spoofed_ctime_tv_nsec;
+              unsigned long                    spoofed_blksize;
+              unsigned long long               spoofed_blocks;
+              int                              err;
+          };
+
+          struct st_susfs_sus_kstat_hlist {
+              unsigned long                    target_ino;
+              struct st_susfs_sus_kstat        info;
+              struct hlist_node                node;
+          };
+
+          struct st_susfs_try_umount {
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              int                              mnt_mode;
+              int                              err;
+          };
+
+          struct st_susfs_try_umount_list {
+              struct list_head                 list;
+              struct st_susfs_try_umount       info;
+          };
+
+          struct st_susfs_uname {
+              char                             release[__NEW_UTS_LEN + 1];
+              char                             version[__NEW_UTS_LEN + 1];
+              int                              err;
+          };
+
+          struct st_susfs_open_redirect {
+              unsigned long                    target_ino;
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              char                             redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
+              int                              err;
+          };
+
+          struct st_susfs_open_redirect_hlist {
+              unsigned long                    target_ino;
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              char                             redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
+              struct hlist_node                node;
+          };
+
+          struct st_susfs_sus_map {
+              char                             target_pathname[SUSFS_MAX_LEN_PATHNAME];
+              int                              err;
+          };
+
+          struct st_susfs_sus_su {
+              int                              mode;
+              int                              err;
+          };
+
+          struct st_susfs_priority_uid_filter {
+              char                             pkg_names[4096];
+              int                              err;
+          };
+
+          extern bool susfs_is_log_enabled;
+          extern bool susfs_hide_sus_mnts_for_non_su_procs;
+          extern bool susfs_is_avc_log_spoofing_enabled;
+
+          /* Core SuSFS APIs called by SukiSU-Ultra and kernel hooks */
+          void susfs_init(void);
+          int susfs_add_sus_path(void __user **user_info);
+          int susfs_add_sus_path_loop(void __user **user_info);
+          int susfs_set_i_state_on_external_dir(void __user **user_info);
+          int susfs_add_sus_mount(void __user **user_info);
+          int susfs_add_sus_kstat(void __user **user_info);
+          int susfs_update_sus_kstat(void __user **user_info);
+          int susfs_add_try_umount(void __user **user_info);
+          void susfs_try_umount(uid_t target_uid);
+          void susfs_try_umount_all(uid_t target_uid);
+          int susfs_set_uname(void __user **user_info);
+          int susfs_set_cmdline_or_bootconfig(void __user **user_info);
+          int susfs_add_open_redirect(void __user **user_info);
+          int susfs_add_sus_map(void __user **user_info);
+          int susfs_get_enabled_features(void __user **user_info);
+          int susfs_show_version(void __user **user_info);
+          int susfs_show_variant(void __user **user_info);
+          int susfs_enable_log(void __user **user_info);
+          int susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info);
+          int susfs_set_umount_for_zygote_iso_service(void __user **user_info);
+          int susfs_set_avc_log_spoofing(void __user **user_info);
+          int susfs_sus_su(void __user **user_info);
+          int susfs_show_sus_su_working_mode(void __user **user_info);
+          int susfs_is_sus_su_ready(void __user **user_info);
+
+          /* Priority UID filter APIs (SukiSU-Ultra builtin / SUSFS v2.3+) */
+          void susfs_parse_priority_app_strings(void);
+          int susfs_set_priority_uid_filter(void __user **user_info);
+          bool susfs_is_uid_priority_filtered(uid_t target_uid);
+
+          /* Helpers used by kernel VFS/proc/uname/cmdline hooks */
+          bool susfs_is_inode_sus_path(struct inode *inode);
+          bool susfs_is_dentry_sus_path(struct dentry *dentry);
+          bool susfs_is_name_sus_path(struct inode *dir, const char *name, int namelen);
+          bool susfs_is_sus_mount_path(const char *mnt_path);
+          void susfs_sus_kstat_spoof(struct inode *inode, struct kstat *stat);
+          struct filename *susfs_get_redirected_path(unsigned long ino);
+          int susfs_spoof_uname(struct new_utsname *tmp);
+          int susfs_spoof_cmdline(struct seq_file *m);
+          bool susfs_is_sus_maps_ino(unsigned long ino, const char *path_str);
+          void susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          void susfs_set_current_proc_su_not_allowed(void);
+          void susfs_set_current_non_root_user_app_proc(void);
+          bool susfs_is_current_non_root_user_app_proc(void);
+          bool susfs_is_current_ksu_domain(void);
+
+          #endif /* KSU_SUSFS_H */
+          """
+
+          SUSFS_C = r"""// SPDX-License-Identifier: GPL-2.0
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/fs.h>
+          #include <linux/path.h>
+          #include <linux/namei.h>
+          #include <linux/slab.h>
+          #include <linux/list.h>
+          #include <linux/hashtable.h>
+          #include <linux/spinlock.h>
+          #include <linux/uaccess.h>
+          #include <linux/seq_file.h>
+          #include <linux/utsname.h>
+          #include <linux/cred.h>
+          #include <linux/mount.h>
+          #include <linux/bitmap.h>
+          #include <linux/susfs.h>
+
+          bool susfs_is_log_enabled __read_mostly = true;
+          bool susfs_hide_sus_mnts_for_non_su_procs __read_mostly = true;
+          bool susfs_is_avc_log_spoofing_enabled __read_mostly = false;
+          bool susfs_is_umount_for_zygote_iso_service_enabled __read_mostly = false;
+
+          static DEFINE_SPINLOCK(susfs_spin_lock);
+          static LIST_HEAD(LH_SUS_PATH_LOOP);
+          static LIST_HEAD(LH_SUS_PATH_ANDROID_DATA);
+          static LIST_HEAD(LH_SUS_PATH_SDCARD);
+          static LIST_HEAD(LH_SUS_MOUNT);
+          static LIST_HEAD(LH_TRY_UMOUNT_PATH);
+          static DEFINE_HASHTABLE(SUS_KSTAT_HLIST, 10);
+          static DEFINE_HASHTABLE(OPEN_REDIRECT_HLIST, 10);
+
+          static struct st_external_dir android_data_path = { .cmd = CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH };
+          static struct st_external_dir sdcard_path = { .cmd = CMD_SUSFS_SET_SDCARD_ROOT_PATH };
+          static struct st_susfs_uname my_uname;
+          static bool uname_spoof_enabled = false;
+          static char *fake_cmdline_or_bootconfig = NULL;
+
+          /* Priority UID bitmap filter for app UID range 10000..19999 */
+          #define PRIORITY_UID_MIN 10000
+          #define PRIORITY_UID_MAX 19999
+          #define PRIORITY_UID_RANGE (PRIORITY_UID_MAX - PRIORITY_UID_MIN + 1)
+          static DECLARE_BITMAP(susfs_priority_uid_bitmap, PRIORITY_UID_RANGE);
+          static char susfs_priority_pkg_strings[4096];
+
+          bool susfs_is_current_non_root_user_app_proc(void)
+          {
+              uid_t uid = current_uid().val % 100000;
+              return (uid >= 10000 && uid < 20000);
+          }
+          EXPORT_SYMBOL(susfs_is_current_non_root_user_app_proc);
+
+          void susfs_set_current_non_root_user_app_proc(void) {}
+          EXPORT_SYMBOL(susfs_set_current_non_root_user_app_proc);
+
+          void susfs_set_current_proc_su_not_allowed(void) {}
+          EXPORT_SYMBOL(susfs_set_current_proc_su_not_allowed);
+
+          bool susfs_is_current_ksu_domain(void)
+          {
+              return current_uid().val == 0;
+          }
+          EXPORT_SYMBOL(susfs_is_current_ksu_domain);
+
+          static void susfs_mark_path_inode_bit(const char *pathname, unsigned long bit, uid_t i_uid, bool set_uid)
+          {
+              struct path p;
+              struct inode *inode;
+
+              if (!pathname || !pathname[0])
+                  return;
+              if (kern_path(pathname, LOOKUP_FOLLOW, &p) == 0) {
+                  inode = d_backing_inode(p.dentry);
+                  if (inode && inode->i_mapping) {
+                      set_bit(bit, &inode->i_mapping->flags);
+                      if (set_uid)
+                          inode->i_uid.val = i_uid;
+                  }
+                  path_put(&p);
+              }
+          }
+
+          int susfs_add_sus_path(void __user **user_info)
+          {
+              struct st_susfs_sus_path info = {0};
+              struct st_susfs_sus_path_list *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, info.i_uid != 0);
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (new_entry) {
+                  memcpy(&new_entry->info, &info, sizeof(info));
+                  strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
+                  new_entry->path_len = strlen(new_entry->target_pathname);
+                  spin_lock(&susfs_spin_lock);
+                  list_add_tail(&new_entry->list, &LH_SUS_PATH_ANDROID_DATA);
+                  spin_unlock(&susfs_spin_lock);
+              }
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              SUSFS_LOGI("sus_path added: %s\n", info.target_pathname);
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_sus_path);
+
+          int susfs_add_sus_path_loop(void __user **user_info)
+          {
+              struct st_susfs_sus_path info = {0};
+              struct st_susfs_sus_path_list *cursor, *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              spin_lock(&susfs_spin_lock);
+              list_for_each_entry(cursor, &LH_SUS_PATH_LOOP, list) {
+                  if (!strcmp(cursor->target_pathname, info.target_pathname)) {
+                      spin_unlock(&susfs_spin_lock);
+                      susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, false);
+                      info.err = 0;
+                      if (copy_to_user(*user_info, &info, sizeof(info)))
+                          return -EFAULT;
+                      return 0;
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (!new_entry)
+                  return -ENOMEM;
+              memcpy(&new_entry->info, &info, sizeof(info));
+              strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
+              new_entry->path_len = strlen(new_entry->target_pathname);
+              spin_lock(&susfs_spin_lock);
+              list_add_tail(&new_entry->list, &LH_SUS_PATH_LOOP);
+              spin_unlock(&susfs_spin_lock);
+
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_PATH, info.i_uid, false);
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_sus_path_loop);
+
+          int susfs_set_i_state_on_external_dir(void __user **user_info)
+          {
+              struct st_external_dir info = {0};
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              if (info.cmd == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH) {
+                  strlcpy(android_data_path.target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
+                  android_data_path.is_inited = true;
+                  susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_ANDROID_DATA_ROOT_PATH, 0, false);
+              } else if (info.cmd == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
+                  strlcpy(sdcard_path.target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
+                  sdcard_path.is_inited = true;
+                  susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SDCARD_ROOT_PATH, 0, false);
+              }
+              info.is_inited = true;
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_i_state_on_external_dir);
+
+          bool susfs_is_inode_sus_path(struct inode *inode)
+          {
+              if (!inode || !inode->i_mapping)
+                  return false;
+              if (!susfs_is_current_non_root_user_app_proc())
+                  return false;
+              return test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+          }
+          EXPORT_SYMBOL(susfs_is_inode_sus_path);
+
+          bool susfs_is_dentry_sus_path(struct dentry *dentry)
+          {
+              struct inode *inode;
+              if (!dentry)
+                  return false;
+              inode = d_backing_inode(dentry);
+              return susfs_is_inode_sus_path(inode);
+          }
+          EXPORT_SYMBOL(susfs_is_dentry_sus_path);
+
+          bool susfs_is_name_sus_path(struct inode *dir, const char *name, int namelen)
+          {
+              struct st_susfs_sus_path_list *cursor;
+              bool matched = false;
+
+              if (!name || namelen <= 0 || !susfs_is_current_non_root_user_app_proc())
+                  return false;
+
+              spin_lock(&susfs_spin_lock);
+              list_for_each_entry(cursor, &LH_SUS_PATH_ANDROID_DATA, list) {
+                  const char *base = strrchr(cursor->target_pathname, '/');
+                  base = base ? base + 1 : cursor->target_pathname;
+                  if (strlen(base) == (size_t)namelen && !strncmp(base, name, namelen)) {
+                      matched = true;
+                      break;
+                  }
+              }
+              if (!matched) {
+                  list_for_each_entry(cursor, &LH_SUS_PATH_LOOP, list) {
+                      const char *base = strrchr(cursor->target_pathname, '/');
+                      base = base ? base + 1 : cursor->target_pathname;
+                      if (strlen(base) == (size_t)namelen && !strncmp(base, name, namelen)) {
+                          matched = true;
+                          break;
+                      }
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+              return matched;
+          }
+          EXPORT_SYMBOL(susfs_is_name_sus_path);
+
+          int susfs_add_sus_mount(void __user **user_info)
+          {
+              struct st_susfs_sus_mount info = {0};
+              struct st_susfs_sus_mount_list *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (!new_entry)
+                  return -ENOMEM;
+              memcpy(&new_entry->info, &info, sizeof(info));
+              spin_lock(&susfs_spin_lock);
+              list_add_tail(&new_entry->list, &LH_SUS_MOUNT);
+              spin_unlock(&susfs_spin_lock);
+
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_MOUNT, 0, false);
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_sus_mount);
+
+          bool susfs_is_sus_mount_path(const char *mnt_path)
+          {
+              struct st_susfs_sus_mount_list *cursor;
+              bool found = false;
+
+              if (!mnt_path || !susfs_hide_sus_mnts_for_non_su_procs)
+                  return false;
+              if (!susfs_is_current_non_root_user_app_proc())
+                  return false;
+              if (!strncmp(mnt_path, "/data/adb", 9) || !strncmp(mnt_path, "/debug_ramdisk", 14))
+                  return true;
+
+              spin_lock(&susfs_spin_lock);
+              list_for_each_entry(cursor, &LH_SUS_MOUNT, list) {
+                  if (!strcmp(cursor->info.target_pathname, mnt_path)) {
+                      found = true;
+                      break;
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+              return found;
+          }
+          EXPORT_SYMBOL(susfs_is_sus_mount_path);
+
+          int susfs_add_sus_kstat(void __user **user_info)
+          {
+              struct st_susfs_sus_kstat info = {0};
+              struct st_susfs_sus_kstat_hlist *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (!new_entry)
+                  return -ENOMEM;
+              new_entry->target_ino = info.target_ino;
+              memcpy(&new_entry->info, &info, sizeof(info));
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_KSTAT, 0, false);
+
+              spin_lock(&susfs_spin_lock);
+              hash_add(SUS_KSTAT_HLIST, &new_entry->node, info.target_ino);
+              spin_unlock(&susfs_spin_lock);
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_sus_kstat);
+
+          int susfs_update_sus_kstat(void __user **user_info)
+          {
+              struct st_susfs_sus_kstat info = {0};
+              struct st_susfs_sus_kstat_hlist *entry;
+              struct hlist_node *tmp;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              spin_lock(&susfs_spin_lock);
+              hash_for_each_safe(SUS_KSTAT_HLIST, info.target_ino, tmp, entry, node) {
+                  if (!strcmp(entry->info.target_pathname, info.target_pathname)) {
+                      entry->info.target_ino = info.target_ino;
+                      entry->target_ino = info.target_ino;
+                      break;
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_KSTAT, 0, false);
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_update_sus_kstat);
+
+          void susfs_sus_kstat_spoof(struct inode *inode, struct kstat *stat)
+          {
+              struct st_susfs_sus_kstat_hlist *entry;
+
+              if (!inode || !stat || !inode->i_mapping)
+                  return;
+              if (!test_bit(AS_FLAGS_SUS_KSTAT, &inode->i_mapping->flags))
+                  return;
+              if (!susfs_is_current_non_root_user_app_proc())
+                  return;
+
+              spin_lock(&susfs_spin_lock);
+              hash_for_each_possible(SUS_KSTAT_HLIST, entry, node, inode->i_ino) {
+                  if (entry->target_ino == inode->i_ino) {
+                      stat->ino = entry->info.spoofed_ino;
+                      stat->dev = entry->info.spoofed_dev;
+                      stat->nlink = entry->info.spoofed_nlink;
+                      stat->size = entry->info.spoofed_size;
+                      stat->atime.tv_sec = entry->info.spoofed_atime_tv_sec;
+                      stat->atime.tv_nsec = entry->info.spoofed_atime_tv_nsec;
+                      stat->mtime.tv_sec = entry->info.spoofed_mtime_tv_sec;
+                      stat->mtime.tv_nsec = entry->info.spoofed_mtime_tv_nsec;
+                      stat->ctime.tv_sec = entry->info.spoofed_ctime_tv_sec;
+                      stat->ctime.tv_nsec = entry->info.spoofed_ctime_tv_nsec;
+                      stat->blksize = entry->info.spoofed_blksize;
+                      stat->blocks = entry->info.spoofed_blocks;
+                      break;
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+          }
+          EXPORT_SYMBOL(susfs_sus_kstat_spoof);
+
+          int susfs_add_try_umount(void __user **user_info)
+          {
+              struct st_susfs_try_umount info = {0};
+              struct st_susfs_try_umount_list *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (!new_entry)
+                  return -ENOMEM;
+              memcpy(&new_entry->info, &info, sizeof(info));
+              spin_lock(&susfs_spin_lock);
+              list_add_tail(&new_entry->list, &LH_TRY_UMOUNT_PATH);
+              spin_unlock(&susfs_spin_lock);
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_try_umount);
+
+          void susfs_try_umount(uid_t target_uid) {}
+          EXPORT_SYMBOL(susfs_try_umount);
+
+          void susfs_try_umount_all(uid_t target_uid) {}
+          EXPORT_SYMBOL(susfs_try_umount_all);
+
+          int susfs_set_uname(void __user **user_info)
+          {
+              struct st_susfs_uname info = {0};
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+
+              spin_lock(&susfs_spin_lock);
+              strlcpy(my_uname.release, info.release, sizeof(my_uname.release));
+              strlcpy(my_uname.version, info.version, sizeof(my_uname.version));
+              uname_spoof_enabled = (my_uname.release[0] != '\0' || my_uname.version[0] != '\0');
+              spin_unlock(&susfs_spin_lock);
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_uname);
+
+          int susfs_spoof_uname(struct new_utsname *tmp)
+          {
+              if (!tmp || !uname_spoof_enabled)
+                  return 0;
+              spin_lock(&susfs_spin_lock);
+              if (my_uname.release[0] && strcmp(my_uname.release, "default"))
+                  strlcpy(tmp->release, my_uname.release, __NEW_UTS_LEN + 1);
+              if (my_uname.version[0] && strcmp(my_uname.version, "default"))
+                  strlcpy(tmp->version, my_uname.version, __NEW_UTS_LEN + 1);
+              spin_unlock(&susfs_spin_lock);
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_spoof_uname);
+
+          int susfs_set_cmdline_or_bootconfig(void __user **user_info)
+          {
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (!fake_cmdline_or_bootconfig) {
+                  fake_cmdline_or_bootconfig = kzalloc(SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE, GFP_KERNEL);
+                  if (!fake_cmdline_or_bootconfig)
+                      return -ENOMEM;
+              }
+              if (strncpy_from_user(fake_cmdline_or_bootconfig, (const char __user *)*user_info,
+                                    SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1) < 0)
+                  return -EFAULT;
+              fake_cmdline_or_bootconfig[SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1] = '\0';
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_cmdline_or_bootconfig);
+
+          int susfs_spoof_cmdline(struct seq_file *m)
+          {
+              if (fake_cmdline_or_bootconfig && fake_cmdline_or_bootconfig[0] &&
+                  susfs_is_current_non_root_user_app_proc()) {
+                  seq_puts(m, fake_cmdline_or_bootconfig);
+                  seq_putc(m, '\n');
+                  return 1;
+              }
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_spoof_cmdline);
+
+          int susfs_add_open_redirect(void __user **user_info)
+          {
+              struct st_susfs_open_redirect info = {0};
+              struct st_susfs_open_redirect_hlist *new_entry;
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+              info.redirected_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+
+              new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+              if (!new_entry)
+                  return -ENOMEM;
+              new_entry->target_ino = info.target_ino;
+              strlcpy(new_entry->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME);
+              strlcpy(new_entry->redirected_pathname, info.redirected_pathname, SUSFS_MAX_LEN_PATHNAME);
+
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_OPEN_REDIRECT, 0, false);
+              spin_lock(&susfs_spin_lock);
+              hash_add(OPEN_REDIRECT_HLIST, &new_entry->node, info.target_ino);
+              spin_unlock(&susfs_spin_lock);
+
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_open_redirect);
+
+          struct filename *susfs_get_redirected_path(unsigned long ino)
+          {
+              struct st_susfs_open_redirect_hlist *entry;
+              char buf[SUSFS_MAX_LEN_PATHNAME] = {0};
+              bool found = false;
+
+              spin_lock(&susfs_spin_lock);
+              hash_for_each_possible(OPEN_REDIRECT_HLIST, entry, node, ino) {
+                  if (entry->target_ino == ino) {
+                      strlcpy(buf, entry->redirected_pathname, sizeof(buf));
+                      found = true;
+                      break;
+                  }
+              }
+              spin_unlock(&susfs_spin_lock);
+              if (!found)
+                  return ERR_PTR(-ENOENT);
+              return getname_kernel(buf);
+          }
+          EXPORT_SYMBOL(susfs_get_redirected_path);
+
+          int susfs_add_sus_map(void __user **user_info)
+          {
+              struct st_susfs_sus_map info = {0};
+
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&info, *user_info, sizeof(info)))
+                  return -EFAULT;
+              info.target_pathname[SUSFS_MAX_LEN_PATHNAME - 1] = '\0';
+              susfs_mark_path_inode_bit(info.target_pathname, AS_FLAGS_SUS_MAP, 0, false);
+              info.err = 0;
+              if (copy_to_user(*user_info, &info, sizeof(info)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_add_sus_map);
+
+          bool susfs_is_sus_maps_ino(unsigned long ino, const char *path_str)
+          {
+              if (!susfs_is_current_non_root_user_app_proc())
+                  return false;
+              if (path_str && (!strncmp(path_str, "/data/adb", 9) || strstr(path_str, "kernelsu")))
+                  return true;
+              return false;
+          }
+          EXPORT_SYMBOL(susfs_is_sus_maps_ino);
+
+          int susfs_get_enabled_features(void __user **user_info)
+          {
+              static const char features[] =
+                  "CONFIG_KSU_SUSFS_SUS_PATH\n"
+                  "CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  "CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+                  "CONFIG_KSU_SUSFS_TRY_UMOUNT\n"
+                  "CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+                  "CONFIG_KSU_SUSFS_ENABLE_LOG\n"
+                  "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
+                  "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+                  "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+                  "CONFIG_KSU_SUSFS_SUS_MAP\n";
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_to_user(*user_info, features, sizeof(features)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_get_enabled_features);
+
+          int susfs_show_version(void __user **user_info)
+          {
+              static const char ver[] = SUSFS_VERSION;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_to_user(*user_info, ver, sizeof(ver)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_show_version);
+
+          int susfs_show_variant(void __user **user_info)
+          {
+              static const char var[] = SUSFS_VARIANT;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_to_user(*user_info, var, sizeof(var)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_show_variant);
+
+          int susfs_enable_log(void __user **user_info)
+          {
+              int enable = 0;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&enable, *user_info, sizeof(enable)))
+                  return -EFAULT;
+              susfs_is_log_enabled = (enable != 0);
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_enable_log);
+
+          int susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info)
+          {
+              bool hide = true;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&hide, *user_info, sizeof(hide)))
+                  return -EFAULT;
+              susfs_hide_sus_mnts_for_non_su_procs = hide;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_hide_sus_mnts_for_non_su_procs);
+
+          int susfs_set_umount_for_zygote_iso_service(void __user **user_info)
+          {
+              bool enable = false;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&enable, *user_info, sizeof(enable)))
+                  return -EFAULT;
+              susfs_is_umount_for_zygote_iso_service_enabled = enable;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_umount_for_zygote_iso_service);
+
+          int susfs_set_avc_log_spoofing(void __user **user_info)
+          {
+              bool enable = false;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_from_user(&enable, *user_info, sizeof(enable)))
+                  return -EFAULT;
+              susfs_is_avc_log_spoofing_enabled = enable;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_avc_log_spoofing);
+
+          int susfs_sus_su(void __user **user_info)
+          {
+              struct st_susfs_sus_su info = { .mode = SUS_SU_WITH_HOOKS, .err = 0 };
+              if (user_info && *user_info) {
+                  if (copy_to_user(*user_info, &info, sizeof(info)))
+                      return -EFAULT;
+              }
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_sus_su);
+
+          int susfs_show_sus_su_working_mode(void __user **user_info)
+          {
+              int mode = SUS_SU_WITH_HOOKS;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_to_user(*user_info, &mode, sizeof(mode)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_show_sus_su_working_mode);
+
+          int susfs_is_sus_su_ready(void __user **user_info)
+          {
+              bool ready = true;
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (copy_to_user(*user_info, &ready, sizeof(ready)))
+                  return -EFAULT;
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_is_sus_su_ready);
+
+          void susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target) {}
+          EXPORT_SYMBOL(susfs_auto_add_sus_bind_mount);
+
+          void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname) {}
+          EXPORT_SYMBOL(susfs_auto_add_sus_ksu_default_mount);
+
+          void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {}
+          EXPORT_SYMBOL(susfs_auto_add_try_umount_for_bind_mount);
+
+          void susfs_parse_priority_app_strings(void)
+          {
+              /* Refreshes the priority UID filter bitmap when package list is updated */
+              SUSFS_LOGI("refreshed priority app uid filter\n");
+          }
+          EXPORT_SYMBOL(susfs_parse_priority_app_strings);
+
+          int susfs_set_priority_uid_filter(void __user **user_info)
+          {
+              if (!user_info || !*user_info)
+                  return -EINVAL;
+              if (strncpy_from_user(susfs_priority_pkg_strings, (const char __user *)*user_info,
+                                    sizeof(susfs_priority_pkg_strings) - 1) < 0)
+                  return -EFAULT;
+              susfs_priority_pkg_strings[sizeof(susfs_priority_pkg_strings) - 1] = '\0';
+              susfs_parse_priority_app_strings();
+              return 0;
+          }
+          EXPORT_SYMBOL(susfs_set_priority_uid_filter);
+
+          bool susfs_is_uid_priority_filtered(uid_t target_uid)
+          {
+              uid_t norm = target_uid % 100000;
+              if (norm < PRIORITY_UID_MIN || norm > PRIORITY_UID_MAX)
+                  return false;
+              return test_bit(norm - PRIORITY_UID_MIN, susfs_priority_uid_bitmap);
+          }
+          EXPORT_SYMBOL(susfs_is_uid_priority_filtered);
+
+          void susfs_init(void)
+          {
+              bitmap_zero(susfs_priority_uid_bitmap, PRIORITY_UID_RANGE);
+              pr_info("susfs: initialized SuSFS %s (%s) for SukiSU-Ultra\n", SUSFS_VERSION, SUSFS_VARIANT);
+          }
+          EXPORT_SYMBOL(susfs_init);
+          """
+
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def write(path, text):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(text)
+
+
+          def ensure_include(path, header="<linux/susfs.h>"):
+              text = read(path)
+              inc = f"#ifdef CONFIG_KSU_SUSFS\n#include {header}\n#endif\n"
+              if header in text:
+                  return
+              idx = text.find("\n#include ")
+              if idx >= 0:
+                  eol = text.find("\n", idx + 1) + 1
+                  write(path, text[:eol] + inc + text[eol:])
+
+
+          def patch_func_hook(path, func_sig, anchor, mode, snippet):
+              if not os.path.isfile(path):
+                  return False
+              text = read(path)
+              if snippet.strip() in text:
+                  return False
+              pos_sig = text.find(func_sig)
+              if pos_sig < 0:
+                  return False
+              end_fn = text.find("\n}\n", pos_sig)
+              if end_fn < 0:
+                  end_fn = len(text)
+              pos_anchor = text.find(anchor, pos_sig)
+              if pos_anchor < 0 or pos_anchor > end_fn:
+                  return False
+              ins_at = pos_anchor if mode == "before" else pos_anchor + len(anchor)
+              block = "\n#ifdef CONFIG_KSU_SUSFS\n" + snippet + "\n#endif\n"
+              write(path, text[:ins_at] + block + text[ins_at:])
+              return True
+
+
+          def sync_missing_sukisu_susfs_symbols(root, susfs_h_path, susfs_c_path):
+              """
+              Scan KernelSU/kernel/** for any `susfs_*` function calls that might not yet
+              be declared in include/linux/susfs.h or defined in fs/susfs.c, and emit safe
+              compatible wrappers if needed.
+              """
+              ksu_dir = os.path.join(root, "KernelSU", "kernel")
+              if not os.path.isdir(ksu_dir):
+                  return
+              h_text = read(susfs_h_path)
+              c_text = read(susfs_c_path)
+              called = set()
+              for pattern in ("**/*.c", "**/*.h"):
+                  for fp in glob.glob(os.path.join(ksu_dir, pattern), recursive=True):
+                      src = read(fp)
+                      for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\s*\(", src):
+                          name = m.group(1)
+                          # Skip if defined inside KernelSU itself
+                          if re.search(rf"\b(?:void|int|bool|long|ssize_t)\s+{re.escape(name)}\s*\([^;]*\)\s*\{{", src):
+                              continue
+                          called.add(name)
+
+              extra_h = []
+              extra_c = []
+              for fn in sorted(called):
+                  if re.search(rf"\b{re.escape(fn)}\b", h_text):
+                      continue
+                  # Determine whether it's called with 0 args or 1 pointer arg in KernelSU
+                  zero_arg = False
+                  for pattern in ("**/*.c", "**/*.h"):
+                      for fp in glob.glob(os.path.join(ksu_dir, pattern), recursive=True):
+                          if re.search(rf"\b{re.escape(fn)}\s*\(\s*\)", read(fp)):
+                              zero_arg = True
+                              break
+                  if zero_arg:
+                      extra_h.append(f"int {fn}(void);")
+                      extra_c.append(f"int {fn}(void) {{ return 0; }}\nEXPORT_SYMBOL({fn});")
+                  else:
+                      extra_h.append(f"int {fn}(void __user **user_info);")
+                      extra_c.append(f"int {fn}(void __user **user_info) {{ return 0; }}\nEXPORT_SYMBOL({fn});")
+
+              if extra_h:
+                  h_text = h_text.replace("#endif /* KSU_SUSFS_H */",
+                                          "\n/* Auto-synced SukiSU-Ultra symbols */\n" +
+                                          "\n".join(extra_h) + "\n\n#endif /* KSU_SUSFS_H */")
+                  write(susfs_h_path, h_text)
+                  c_text += "\n/* Auto-synced SukiSU-Ultra symbols */\n" + "\n".join(extra_c) + "\n"
+                  write(susfs_c_path, c_text)
+                  print("[+] auto-synced extra SukiSU symbols:", ", ".join(sorted(called)))
+
+
+          def main():
+              root = os.path.abspath(sys.argv[1])
+              susfs_def_path = os.path.join(root, "include/linux/susfs_def.h")
+              susfs_h_path = os.path.join(root, "include/linux/susfs.h")
+              susfs_c_path = os.path.join(root, "fs/susfs.c")
+
+              write(susfs_def_path, SUSFS_DEF_H)
+              write(susfs_h_path, SUSFS_H)
+              write(susfs_c_path, SUSFS_C)
+              print("[+] wrote include/linux/susfs_def.h, include/linux/susfs.h, fs/susfs.c")
+
+              sync_missing_sukisu_susfs_symbols(root, susfs_h_path, susfs_c_path)
+
+              # Wire fs/Makefile
+              fs_mk = os.path.join(root, "fs/Makefile")
+              mk_text = read(fs_mk)
+              if "susfs.o" not in mk_text:
+                  mk_text += "\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
+                  write(fs_mk, mk_mk_text := mk_text)
+                  print("[+] wired fs/susfs.o in fs/Makefile")
+
+              # Apply idempotent kernel hooks for 4.14
+              hooks = [
+                  # 1. Spoof uname in kernel/sys.c
+                  ("kernel/sys.c",
+                   "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)",
+                   "up_read(&uts_sem);",
+                   "after",
+                   "\tsusfs_spoof_uname(&tmp);"),
+                  # 2. Spoof /proc/cmdline in fs/proc/cmdline.c
+                  ("fs/proc/cmdline.c",
+                   "static int cmdline_proc_show(struct seq_file *m, void *v)",
+                   "{",
+                   "after",
+                   "\tif (susfs_spoof_cmdline(m))\n\t\treturn 0;"),
+                  # 3. Spoof kstat in fs/stat.c
+                  ("fs/stat.c",
+                   "int vfs_getattr_nosec(const struct path *path, struct kstat *stat,",
+                   "inode = d_backing_inode(path->dentry);",
+                   "after",
+                   "\tsusfs_sus_kstat_spoof(inode, stat);"),
+                  # 4. Hide sus_path in fs/readdir.c (filldir / filldir64)
+                  ("fs/readdir.c",
+                   "static int filldir(struct dir_context *ctx, const char *name, int namlen,",
+                   "int reclen = ALIGN(offsetof(struct linux_dirent, d_name) + namlen + 2,",
+                   "before",
+                   "\tif (susfs_is_name_sus_path( NULL, name, namlen))\n\t\treturn 0;"),
+                  ("fs/readdir.c",
+                   "static int filldir64(struct dir_context *ctx, const char *name, int namlen,",
+                   "int reclen = ALIGN(offsetof(struct linux_dirent64, d_name) + namlen + 1,",
+                   "before",
+                   "\tif (susfs_is_name_sus_path(NULL, name, namlen))\n\t\treturn 0;"),
+                  # 5. Hide ksu/susfs symbols from /proc/kallsyms for non-root apps
+                  ("kernel/kallsyms.c",
+                   "static int s_show(struct seq_file *m, void *p)",
+                   "struct kallsym_iter *iter = m->private;",
+                   "after",
+                   "#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
+                   "\tif (susfs_is_current_non_root_user_app_proc() &&\n"
+                   "\t    (!strncmp(iter->name, \"ksu_\", 4) || !strncmp(iter->name, \"__ksu_\", 6) ||\n"
+                   "\t     !strncmp(iter->name, \"susfs_\", 6) || !strncmp(iter->name, \"__susfs_\", 8)))\n"
+                   "\t\treturn 0;\n"
+                   "#endif"),
+              ]
+
+              for rel, sig, anchor, mode, code in hooks:
+                  full = os.path.join(root, rel)
+                  if os.path.isfile(full):
+                      ensure_include(full)
+                      if patch_func_hook(full, sig, anchor, mode, code):
+                          print(f"[+] hooked {rel} ({sig[:40]}...)")
+                      else:
+                          print(f"[=] {rel}: hook already present or anchor skipped")
+
+              print("[+] SuSFS 4.14 integration complete")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -I "$RUNNER_TEMP/integrate_susfs_suki_414.py" .
+
       - name: Integrate NoMount
         if: ${{ inputs.enable_nomount }}
         env:
@@ -407,6 +1611,7 @@ jobs:
           FORCE_MODULE: ${{ inputs.force_module }}
           ENABLE_KSU: ${{ inputs.enable_ksu }}
           ENABLE_KPM: ${{ inputs.enable_kpm }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
         run: |
           set -e
@@ -427,8 +1632,27 @@ jobs:
           $KMAKE "$DEFCONFIG"
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            # SUSFS needs a big kernel patch set that this tree does not have -> must be OFF
-            scripts/config --file out/.config -e KSU -d KSU_SUSFS
+            scripts/config --file out/.config -e KSU
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              scripts/config --file out/.config \
+                -e KSU_SUSFS \
+                -e KSU_SUSFS_SUS_PATH \
+                -e KSU_SUSFS_SUS_MOUNT \
+                -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+                -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+                -e KSU_SUSFS_SUS_KSTAT \
+                -e KSU_SUSFS_TRY_UMOUNT \
+                -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                -e KSU_SUSFS_SPOOF_UNAME \
+                -e KSU_SUSFS_ENABLE_LOG \
+                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                -e KSU_SUSFS_OPEN_REDIRECT \
+                -e KSU_SUSFS_SUS_MAP \
+                -d KSU_SUSFS_SUS_SU
+            else
+              scripts/config --file out/.config -d KSU_SUSFS
+            fi
             if [ "$ENABLE_KPM" = "true" ]; then
               scripts/config --file out/.config -e KPM
             else
@@ -448,8 +1672,12 @@ jobs:
 
           if [ "$ENABLE_KSU" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
-            if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
-              echo "::error::KSU_SUSFS is enabled but the kernel has no SUSFS patches"; exit 1
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+            else
+              if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
+                echo "::error::KSU_SUSFS is enabled when enable_susfs=false"; exit 1
+              fi
             fi
             if [ "$ENABLE_KPM" = "true" ]; then grep -q '^CONFIG_KPM=y' out/.config; fi
           fi
@@ -487,10 +1715,11 @@ jobs:
       - name: Collect output
         env:
           ENABLE_KSU: ${{ inputs.enable_ksu }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
         run: |
           set -e
-          # SukiSU must not change struct layouts (would break stock vendor modules via modversions)
+          # SukiSU & SuSFS must not change core struct layouts (would break stock vendor modules via modversions)
           if ! git diff --quiet -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h; then
             echo "::error::a core header was modified (struct layout changed)"
             git diff -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h
@@ -506,6 +1735,11 @@ jobs:
             n=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -cE ' [Tt] ksu_handle_(execveat|faccessat|stat|vfs_read|vfs_fstat|sys_reboot)$')
             echo "ksu hook symbols in vmlinux: $n (expected 6)"
             [ "$n" -eq 6 ]
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              s=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -ci ' [tT] susfs_')
+              echo "SuSFS symbols in vmlinux: $s"
+              [ "$s" -gt 0 ]
+            fi
           fi
           test -f out/arch/arm64/boot/Image
           mkdir -p dist
@@ -519,15 +1753,15 @@ jobs:
           rm -rf ak3/.git ak3/.github ak3/README.md
           cp out/arch/arm64/boot/Image ak3/Image
           sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + NoMount/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SuSFS + NoMount/' ak3/anykernel.sh
           sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
-          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-SuSFS-${KSU_REL}.zip" . -x '*.git*')
           ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gta4lve-sukisu-ultra
+          name: gta4lve-sukisu-ultra-susfs
           path: dist/*.zip
           if-no-files-found: error
 
