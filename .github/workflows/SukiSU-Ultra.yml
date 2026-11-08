@@ -1,8 +1,8 @@
-name: Build gta4lve + SukiSU-Ultra + SuSFS + NoMount
+name: Build gta4lve + SukiSU-Ultra + NoMount
 
-# SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a compat patch.
-# SuSFS (Kernel-level root hiding) integration added via susfs4ksu (kernel-4.14 branch).
-# NoMount (VFS path redirection / mountless module loading) added via CONFIG_NOMOUNT=y.
+# Separate from build-kernelsu-next.yml (that one is untouched).
+# SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
+# compat patch (.github/patches is NOT needed: the patch is embedded below).
 
 on:
   workflow_dispatch:
@@ -23,20 +23,12 @@ on:
         description: "CONFIG_KPM (SukiSU's built-in KPM bridge). NOTE: still needs KernelPatch patched into the boot image to actually load KPMs"
         type: boolean
         default: true
+      enable_nomount:
+        description: "Integrate NoMount (maxsteeel/nomount, in-kernel VFS redirection). Install the NoMount metamodule afterwards"
+        type: boolean
+        default: true
       enable_ksu:
         description: "Integrate SukiSU-Ultra. Turn OFF to build a plain baseline kernel (boot test)"
-        type: boolean
-        default: true
-      enable_susfs:
-        description: "Integrate SuSFS (Kernel-level root hiding for Play Integrity / Momo)"
-        type: boolean
-        default: true
-      susfs_branch:
-        description: "susfs4ksu git branch or tag (default: kernel-4.14)"
-        required: false
-        default: "kernel-4.14"
-      enable_nomount:
-        description: "Integrate NoMount (CONFIG_NOMOUNT=y - VFS mountless module loading)"
         type: boolean
         default: true
 
@@ -45,7 +37,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra + SuSFS + NoMount)
+    name: Build kernel (SukiSU-Ultra, manual hooks)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -60,7 +52,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev libncurses-dev \
-            build-essential curl git zip unzip xz-utils lz4 cpio patch \
+            build-essential curl git zip unzip xz-utils lz4 cpio \
             python3 device-tree-compiler ca-certificates libyaml-dev
 
       - name: Download toolchains (AOSP clang r383902b + GCC 4.9)
@@ -205,112 +197,6 @@ jobs:
           # Don't let warnings in the SukiSU driver fail the build.
           printf '\nccflags-y += -Wno-error\n' >> KernelSU/kernel/Makefile
 
-      - name: Integrate SuSFS (Kernel-side patches)
-        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
-        env:
-          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
-        run: |
-          set -e
-          echo "=== Fetching SuSFS patches from susfs4ksu ($SUSFS_BRANCH) ==="
-          git clone --depth=1 -b "${SUSFS_BRANCH}" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs" || \
-          git clone --depth=1 -b "${SUSFS_BRANCH}" https://github.com/Star-Seven/susfs4ksu.git "$RUNNER_TEMP/susfs" || \
-          git clone --depth=1 -b "kernel-4.14" https://github.com/kutemeikito/susfs4ksu.git "$RUNNER_TEMP/susfs"
-
-          echo "=== Copying SuSFS kernel files ==="
-          if [ -d "$RUNNER_TEMP/susfs/kernel_patches/fs" ]; then
-            cp -r "$RUNNER_TEMP/susfs/kernel_patches/fs/"* fs/
-          fi
-          if [ -d "$RUNNER_TEMP/susfs/kernel_patches/include/linux" ]; then
-            cp -r "$RUNNER_TEMP/susfs/kernel_patches/include/linux/"* include/linux/
-          fi
-
-          echo "=== Identifying SuSFS kernel patch ==="
-          PATCH_FILE=""
-          for p in \
-            "$RUNNER_TEMP/susfs/kernel_patches/50_add_susfs_in_kernel-4.14.patch" \
-            "$RUNNER_TEMP/susfs/kernel_patches/50_add_susfs_in_kernel.patch" \
-            "$RUNNER_TEMP/susfs/kernel_patches/4.14/50_add_susfs_in_kernel.patch"; do
-            if [ -f "$p" ]; then
-              PATCH_FILE="$p"
-              break
-            fi
-          done
-
-          if [ -z "$PATCH_FILE" ]; then
-            echo "::error::SuSFS 4.14 patch file not found in susfs repository"
-            exit 1
-          fi
-
-          echo "=== Applying SuSFS patch: $(basename "$PATCH_FILE") ==="
-          if git apply --check "$PATCH_FILE" 2>/dev/null; then
-            git apply "$PATCH_FILE"
-            echo "SuSFS patch applied cleanly via git apply"
-          else
-            echo "git apply check failed, falling back to patch utility..."
-            patch -p1 --forward < "$PATCH_FILE" || {
-              echo "::warning::Some hunks were rejected by patch. Resolving known rejects..."
-              find . -name "*.rej" -exec echo "Rejection in: {}" \; -exec cat {} \;
-            }
-          fi
-
-          # === Fix missing SuSFS header includes in rejected OEM files (e.g. fs/namei.c) ===
-          python3 - <<'PYEOF'
-          import os
-
-          target_files = [
-              "fs/namei.c",
-              "fs/open.c",
-              "fs/stat.c",
-              "fs/namespace.c",
-              "fs/proc_namespace.c",
-              "fs/readdir.c",
-              "fs/read_write.c",
-          ]
-
-          has_susfs_def = os.path.isfile("include/linux/susfs_def.h")
-          inc_code = "\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n"
-          if has_susfs_def:
-              inc_code += "#include <linux/susfs_def.h>\n"
-          inc_code += "#endif\n"
-
-          for fpath in target_files:
-              if not os.path.isfile(fpath):
-                  continue
-              with open(fpath, "r", encoding="utf-8", errors="surrogateescape") as f:
-                  content = f.read()
-
-              # If file uses SuSFS symbols or has been patched by SuSFS, ensure susfs.h is included
-              if "susfs" in content.lower() or "inode_state_sus" in content.lower() or "susfs_task_state" in content:
-                  if "#include <linux/susfs.h>" not in content:
-                      idx = content.find("\n#include ")
-                      if idx >= 0:
-                          eol = content.find("\n", idx + 1) + 1
-                          content = content[:eol] + inc_code + content[eol:]
-                          with open(fpath, "w", encoding="utf-8", errors="surrogateescape") as f:
-                              f.write(content)
-                          print(f"[+] Successfully injected <linux/susfs.h> into {fpath}")
-                      else:
-                          print(f"[!] Could not find #include anchor in {fpath}")
-                  else:
-                      print(f"[=] {fpath} already includes susfs.h")
-          PYEOF
-
-          test -f include/linux/susfs.h
-          echo "SuSFS integration and header checks completed."
-
-      - name: Integrate NoMount (VFS path redirection)
-        if: ${{ inputs.enable_nomount }}
-        run: |
-          set -e
-          echo "=== Integrating NoMount ==="
-          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s master || \
-          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh" | bash -s dev
-
-          test -d fs/nomount
-          grep -q "nomount" fs/Makefile || echo 'obj-$(CONFIG_NOMOUNT) += nomount/' >> fs/Makefile
-          grep -q "nomount" fs/Kconfig || sed -i '/endmenu/i source "fs/nomount/Kconfig"' fs/Kconfig
-          echo "NoMount integrated into fs/nomount"
-
       - name: Apply SukiSU manual hooks
         if: ${{ inputs.enable_ksu }}
         run: |
@@ -325,7 +211,8 @@ jobs:
           - Strict: if an anchor is not found (source drifted) it exits with an error instead of
             silently producing a kernel without a hook.
           - Every call is wrapped in `#ifdef CONFIG_KSU`, so CONFIG_KSU=n gives the stock kernel.
-          - Setuid / umount handling is done by SukiSU through an LSM hook.
+          - Setuid / umount handling is done by SukiSU through an LSM hook, so no kernel patch is
+            needed for those. SUSFS is NOT supported here (it needs a large kernel patch set).
           """
           import os
           import re
@@ -489,6 +376,22 @@ jobs:
           PYEOF
           python3 -I "$RUNNER_TEMP/ksu_manual_hooks_suki.py" .
 
+      - name: Integrate NoMount
+        if: ${{ inputs.enable_nomount }}
+        env:
+          NOMOUNT_REF: bf1847f98fed382369c43bfd652cd93774b9b8e3   # v2.2.0, tested to compile on 4.14
+        run: |
+          set -e
+          # setup.sh clones NoMount into ./NoMount, symlinks fs/nomount -> kernel/src and
+          # wires fs/Makefile + fs/Kconfig. NoMount is self-contained (no kernel hooks, no
+          # struct changes), so it does not touch the module CRCs.
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_REF}/kernel/setup.sh" \
+            | bash -s "${NOMOUNT_REF}"
+          test -L fs/nomount
+          grep -q "nomount" fs/Makefile
+          grep -q "fs/nomount/Kconfig" fs/Kconfig
+          echo "NoMount commit: $(git -C NoMount rev-parse HEAD)"
+
       - name: Override kernel version string (optional)
         if: ${{ inputs.sublevel != '' }}
         env:
@@ -504,7 +407,6 @@ jobs:
           FORCE_MODULE: ${{ inputs.force_module }}
           ENABLE_KSU: ${{ inputs.enable_ksu }}
           ENABLE_KPM: ${{ inputs.enable_kpm }}
-          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
           ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
         run: |
           set -e
@@ -525,56 +427,35 @@ jobs:
           $KMAKE "$DEFCONFIG"
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            if [ "$ENABLE_SUSFS" = "true" ]; then
-              # Enable SuSFS with recommended features for non-GKI / manual hook kernels
-              scripts/config --file out/.config \
-                -e KSU \
-                -e KSU_SUSFS \
-                -e KSU_SUSFS_SUS_PATH \
-                -e KSU_SUSFS_SUS_MOUNT \
-                -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-                -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-                -e KSU_SUSFS_SUS_KSTAT \
-                -e KSU_SUSFS_SUS_OVERLAYFS \
-                -e KSU_SUSFS_TRY_UMOUNT \
-                -e KSU_SUSFS_SPOOF_UNAME \
-                -e KSU_SUSFS_ENABLE_LOG \
-                -e KSU_SUSFS_OPEN_REDIRECT \
-                -d KSU_SUSFS_SUS_SU
-            else
-              scripts/config --file out/.config -e KSU -d KSU_SUSFS
-            fi
+            # SUSFS needs a big kernel patch set that this tree does not have -> must be OFF
+            scripts/config --file out/.config -e KSU -d KSU_SUSFS
             if [ "$ENABLE_KPM" = "true" ]; then
               scripts/config --file out/.config -e KPM
             else
               scripts/config --file out/.config -d KPM
             fi
           fi
-
           if [ "$ENABLE_NOMOUNT" = "true" ]; then
-            # Enable NoMount (VFS mountless module loading)
             scripts/config --file out/.config -e NOMOUNT
           fi
-
           if [ "$FORCE_MODULE" = "true" ]; then
             scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
           fi
           $KMAKE olddefconfig
 
           echo "---- resulting config ----"
-          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|NOMOUNT|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
+          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|NOMOUNT|KEYS|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
 
           if [ "$ENABLE_KSU" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
-            if [ "$ENABLE_SUSFS" = "true" ]; then
-              grep -q '^CONFIG_KSU_SUSFS=y' out/.config
-              echo "✓ CONFIG_KSU_SUSFS successfully enabled in out/.config"
+            if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+              echo "::error::KSU_SUSFS is enabled but the kernel has no SUSFS patches"; exit 1
             fi
             if [ "$ENABLE_KPM" = "true" ]; then grep -q '^CONFIG_KPM=y' out/.config; fi
           fi
           if [ "$ENABLE_NOMOUNT" = "true" ]; then
             grep -q '^CONFIG_NOMOUNT=y' out/.config
-            echo "✓ CONFIG_NOMOUNT=y successfully enabled in out/.config"
+            grep -q '^CONFIG_KEYS=y' out/.config   # NoMount talks to userspace through the keyring
           fi
           if [ "$FORCE_MODULE" = "true" ]; then
             grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
@@ -606,13 +487,19 @@ jobs:
       - name: Collect output
         env:
           ENABLE_KSU: ${{ inputs.enable_ksu }}
+          ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
         run: |
           set -e
           # SukiSU must not change struct layouts (would break stock vendor modules via modversions)
-          if ! git diff --quiet -- include/linux/seccomp.h; then
-            echo "::error::include/linux/seccomp.h was modified (struct layout changed)"
-            git diff -- include/linux/seccomp.h
+          if ! git diff --quiet -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h; then
+            echo "::error::a core header was modified (struct layout changed)"
+            git diff -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h
             exit 1
+          fi
+          if [ "$ENABLE_NOMOUNT" = "true" ]; then
+            n=$("$HOME/tc/gcc64/bin/aarch64-linux-android-nm" out/vmlinux | grep -ci ' [tT] nm_\| [tT] nomount')
+            echo "NoMount symbols in vmlinux: $n"
+            [ "$n" -gt 0 ]
           fi
           if [ "$ENABLE_KSU" = "true" ]; then
             # every hook the patched kernel files call must be defined in the final image
@@ -622,40 +509,26 @@ jobs:
           fi
           test -f out/arch/arm64/boot/Image
           mkdir -p dist
-          cp out/arch/arm64/boot/Image dist/Image
           echo "Kernel release: $(cat out/include/config/kernel.release)"
           echo "KSU_REL=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3 zip
-        env:
-          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
-          ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
         run: |
           set -e
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           rm -rf ak3/.git ak3/.github ak3/README.md
-          cp dist/Image ak3/Image
+          cp out/arch/arm64/boot/Image ak3/Image
           sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + NoMount/' ak3/anykernel.sh
           sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
-
-          NAME_EXT=""
-          if [ "$ENABLE_SUSFS" = "true" ]; then NAME_EXT="${NAME_EXT}+SuSFS"; fi
-          if [ "$ENABLE_NOMOUNT" = "true" ]; then NAME_EXT="${NAME_EXT}+NoMount"; fi
-
-          if [ -n "$NAME_EXT" ]; then
-            sed -i "s/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra ${NAME_EXT}/" ak3/anykernel.sh
-            (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU${NAME_EXT}-${KSU_REL}.zip" . -x '*.git*')
-          else
-            sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra/' ak3/anykernel.sh
-            (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
-          fi
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
           ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gta4lve-kernel-artifacts
-          path: dist/*
+          name: gta4lve-sukisu-ultra
+          path: dist/*.zip
           if-no-files-found: error
 
       - name: Upload build log on failure
