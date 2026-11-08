@@ -712,16 +712,20 @@ jobs:
           from pathlib import Path
           p = Path("fs/namei.c")
           s = p.read_text()
-          block = "\t#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\tnd->state |= ND_STATE_OPEN_LAST;\n\t#endif\n"
-          if block in s:
-              s = s.replace(block, "", 1)
-              anchor = "\tint error;\n"
-              if anchor not in s:
-                  raise SystemExit("namei.c declaration anchor not found")
-              s = s.replace(anchor, anchor + block, 1)
-          p.write_text(s)
+          start = s.index("static int do_last(")
+          end = s.index("\n}\n", start) + 3
+          fn = s[start:end]
+          block = "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\tnd->state |= ND_STATE_OPEN_LAST;\n#endif\n"
+          if block not in fn:
+              raise SystemExit("do_last SUSFS state block not found")
+          fn = fn.replace(block, "", 1)
+          anchor = "\tint error;\n"
+          if anchor not in fn:
+              raise SystemExit("do_last declaration anchor not found")
+          fn = fn.replace(anchor, anchor + block, 1)
+          p.write_text(s[:start] + fn + s[end:])
           PYFIX
-          grep -n -A4 -B4 'ND_STATE_OPEN_LAST' fs/namei.c
+          sed -n '/static int do_last(/,/^}/p' fs/namei.c | head -28
       - name: Apply SukiSU manual hooks (only when SUSFS is off)
         if: ${{ inputs.enable_ksu && !inputs.enable_susfs }}
         run: |
