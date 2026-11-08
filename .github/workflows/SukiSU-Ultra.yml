@@ -18,7 +18,8 @@ on:
       sublevel:
         description: "Override SUBLEVEL in Makefile (version string only, e.g. 186 -> 4.14.186). Empty = keep source value"
         required: false
-        default: "186"
+        # Known-good baseline from the previously working build: 4.14.199.
+        default: "199"
       force_module:
         description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
         type: boolean
@@ -26,13 +27,14 @@ on:
       enable_kpm:
         description: "CONFIG_KPM (SukiSU's built-in KPM bridge). NOTE: still needs KernelPatch patched into the boot image to actually load KPMs"
         type: boolean
-        default: true
+        # KPM requires a KernelPatch-patched boot image; keep it off for the baseline.
+        default: false
       enable_susfs:
-        description: "SUSFS v2.3.0 (ported to this 4.14 tree, replaces the plain manual hooks). Turn OFF to get the previous SukiSU-only build"
+        description: "Enable SUSFS v2.3.0 port for this 4.14 tree"
         type: boolean
         default: true
       enable_nomount:
-        description: "Integrate NoMount (maxsteeel/nomount, in-kernel VFS redirection). Install the NoMount metamodule afterwards"
+        description: "Integrate NoMount (maxsteeel/nomount) as built-in CONFIG_NOMOUNT=y"
         type: boolean
         default: true
       enable_ksu:
@@ -45,7 +47,7 @@ env:
 
 jobs:
   build:
-    name: Build kernel (SukiSU-Ultra, manual hooks)
+    name: Build kernel (SukiSU-Ultra + optional SUSFS/NoMount)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
@@ -978,8 +980,11 @@ jobs:
               scripts/config --file out/.config -e KSU_SUSFS \
                 -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
                 -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
-                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
                 -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP
+              # Do not hide KSU/SUSFS symbols or rewrite cmdline on this legacy non-GKI
+              # device; both are anti-detection options and are not needed for SUSFS.
+              scripts/config --file out/.config -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
             else
               scripts/config --file out/.config -d KSU_SUSFS
             fi
@@ -1006,6 +1011,8 @@ jobs:
               grep -q '^CONFIG_KSU_SUSFS=y' out/.config
               grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y' out/.config
               grep -q '^CONFIG_KSU_SUSFS_SUS_PATH=y' out/.config
+              ! grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' out/.config
+              ! grep -q '^CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' out/.config
             elif grep -q '^CONFIG_KSU_SUSFS' out/.config; then
               echo "::error::KSU_SUSFS is enabled but SUSFS is not integrated"; exit 1
             fi
