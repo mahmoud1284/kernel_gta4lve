@@ -406,20 +406,23 @@ jobs:
           1. KABI / Module CRC preservation: NEVER modifies `include/linux/sched.h`,
              `include/linux/mount.h`, or `include/linux/seccomp.h`. Per-inode state uses
              high bits in `inode->i_mapping->flags`, and per-task non-root app state uses
-             a thread_info flag or UID check.
+             UID range checks.
           2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
-             including both SuSFS v1.5.x/v2.x supercalls and priority UID filter APIs
-             (`susfs_parse_priority_app_strings`, `susfs_set_priority_uid_filter`, etc.).
+             including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `path_umount`
+             4.14 backport in `fs/namespace.c`, and preserving SukiSU-Ultra's own SELinux
+             `susfs_*` definitions in `drivers/kernelsu/selinux/`.
           3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
              `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
-             variable declarations (and guarded with `-Wdeclaration-after-statement` pragmas).
+             variable declarations.
           """
           import glob
           import os
           import re
           import sys
+          import textwrap
 
-          SUSFS_DEF_H = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          SUSFS_DEF_H = textwrap.dedent(r"""\
+          /* SPDX-License-Identifier: GPL-2.0 */
           #ifndef KSU_SUSFS_DEF_H
           #define KSU_SUSFS_DEF_H
 
@@ -427,6 +430,7 @@ jobs:
 
           #define SUSFS_VERSION "v2.0.0"
           #define SUSFS_VARIANT "NON-GKI"
+          #define SUSFS_MAGIC 0xFAFAFAFA
 
           /* Supercall command numbers */
           #define CMD_SUSFS_ADD_SUS_PATH 0x55550
@@ -500,9 +504,10 @@ jobs:
           #define DATA_ADB_NO_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT "/data/adb/susfs_no_auto_add_try_umount_for_bind_mount"
 
           #endif /* KSU_SUSFS_DEF_H */
-          """
+          """)
 
-          SUSFS_H = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          SUSFS_H = textwrap.dedent(r"""\
+          /* SPDX-License-Identifier: GPL-2.0 */
           #ifndef KSU_SUSFS_H
           #define KSU_SUSFS_H
 
@@ -514,7 +519,22 @@ jobs:
           #include <linux/fs.h>
           #include <linux/sched.h>
           #include <linux/cred.h>
+          #include <linux/uaccess.h>
           #include <linux/susfs_def.h>
+
+          #define SUSFS_VERSION "v2.0.0"
+          #define SUSFS_VARIANT "NON-GKI"
+
+          /* Linux < 5.8 fallback for strncpy_from_user_nofault when SUSFS_INLINE_HOOK is active */
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+          static inline long susfs_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
+          {
+              return strncpy_from_user(dst, (const char __user *)unsafe_addr, count);
+          }
+          #ifndef strncpy_from_user_nofault
+          #define strncpy_from_user_nofault(dst, src, count) susfs_strncpy_from_user_nofault((dst), (src), (count))
+          #endif
+          #endif
 
           #define SUSFS_LOGI(fmt, ...) \
               do { if (susfs_is_log_enabled) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__); } while (0)
@@ -676,11 +696,13 @@ jobs:
           void susfs_set_current_non_root_user_app_proc(void);
           bool susfs_is_current_non_root_user_app_proc(void);
           bool susfs_is_current_ksu_domain(void);
+          int path_umount(struct path *path, int flags);
 
           #endif /* KSU_SUSFS_H */
-          """
+          """)
 
-          SUSFS_C = r"""// SPDX-License-Identifier: GPL-2.0
+          SUSFS_C = textwrap.dedent(r"""\
+          // SPDX-License-Identifier: GPL-2.0
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/fs.h>
@@ -1401,7 +1423,7 @@ jobs:
               pr_info("susfs: initialized SuSFS %s (%s) for SukiSU-Ultra\n", SUSFS_VERSION, SUSFS_VARIANT);
           }
           EXPORT_SYMBOL(susfs_init);
-          """
+          """)
 
 
           def read(path):
@@ -1454,55 +1476,88 @@ jobs:
               return True
 
 
-          def sync_missing_sukisu_susfs_symbols(root, susfs_h_path, susfs_c_path):
+          def ensure_path_umount_in_namespace(root):
+              """Backport path_umount(struct path *path, int flags) to fs/namespace.c if absent."""
+              ns_path = os.path.join(root, "fs/namespace.c")
+              if not os.path.isfile(ns_path):
+                  return
+              text = read(ns_path)
+              if re.search(r"\bint\s+path_umount\s*\(", text):
+                  print("[=] fs/namespace.c: path_umount already present")
+                  return
+              m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
+              if not m:
+                  return
+              # Find end of do_umount
+              end_do = text.find("\n}\n", m.start())
+              if end_do < 0:
+                  return
+              ins_pos = end_do + 3
+              path_umount_fn = (
+                  "\nint path_umount(struct path *path, int flags)\n"
+                  "{\n"
+                  "\tstruct mount *mnt = real_mount(path->mnt);\n"
+                  "\tint ret;\n\n"
+                  "\tret = can_umount(path, flags);\n"
+                  "\tif (!ret)\n"
+                  "\t\tret = do_umount(mnt, flags);\n\n"
+                  "\t/* we mustn't call path_put() as that would clear mnt_expiry_mark */\n"
+                  "\tdput(path->dentry);\n"
+                  "\tmntput_no_expire(mnt);\n"
+                  "\treturn ret;\n"
+                  "}\n"
+                  "EXPORT_SYMBOL(path_umount);\n"
+              )
+              write(ns_path, text[:ins_pos] + path_umount_fn + text[ins_pos:])
+              internal_h = os.path.join(root, "fs/internal.h")
+              if os.path.isfile(internal_h):
+                  ih = read(internal_h)
+                  if "path_umount" not in ih:
+                      write(internal_h, ih + "\nextern int path_umount(struct path *path, int flags);\n")
+              print("[+] backported path_umount() to fs/namespace.c and fs/internal.h")
+
+
+          def fix_sukisu_internal_susfs_declarations(root, susfs_h_path):
               """
-              Scan KernelSU/kernel/** for any `susfs_*` function calls that might not yet
-              be declared in include/linux/susfs.h or defined in fs/susfs.c, and emit safe
-              compatible wrappers if needed.
+              In SukiSU-Ultra's unity build (`ksu_main.c`), `feature/adb_root.c` is included
+              before `selinux/sepolicy.c`, and calls `susfs_add_sus_avd_allowed_by_type(...)`
+              which is defined in `selinux/sepolicy.c` without a header prototype.
+              Extract the exact signature of any `susfs_*` function defined inside
+              `KernelSU/kernel/**/*.c` that lacks a `.h` prototype, and add its exact
+              forward declaration to `include/linux/susfs.h` (never overriding functions
+              already declared in `KernelSU/kernel/**/*.h` like `selinux.h`).
               """
               ksu_dir = os.path.join(root, "KernelSU", "kernel")
               if not os.path.isdir(ksu_dir):
                   return
-              h_text = read(susfs_h_path)
-              c_text = read(susfs_c_path)
-              called = set()
-              for pattern in ("**/*.c", "**/*.h"):
-                  for fp in glob.glob(os.path.join(ksu_dir, pattern), recursive=True):
-                      src = read(fp)
-                      for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\s*\(", src):
-                          name = m.group(1)
-                          # Skip if defined inside KernelSU itself
-                          if re.search(rf"\b(?:void|int|bool|long|ssize_t)\s+{re.escape(name)}\s*\([^;]*\)\s*\{{", src):
-                              continue
-                          called.add(name)
+              h_files = glob.glob(os.path.join(ksu_dir, "**/*.h"), recursive=True)
+              c_files = glob.glob(os.path.join(ksu_dir, "**/*.c"), recursive=True)
 
-              extra_h = []
-              extra_c = []
-              for fn in sorted(called):
-                  if re.search(rf"\b{re.escape(fn)}\b", h_text):
-                      continue
-                  # Determine whether it's called with 0 args or 1 pointer arg in KernelSU
-                  zero_arg = False
-                  for pattern in ("**/*.c", "**/*.h"):
-                      for fp in glob.glob(os.path.join(ksu_dir, pattern), recursive=True):
-                          if re.search(rf"\b{re.escape(fn)}\s*\(\s*\)", read(fp)):
-                              zero_arg = True
-                              break
-                  if zero_arg:
-                      extra_h.append(f"int {fn}(void);")
-                      extra_c.append(f"int {fn}(void) {{ return 0; }}\nEXPORT_SYMBOL({fn});")
-                  else:
-                      extra_h.append(f"int {fn}(void __user **user_info);")
-                      extra_c.append(f"int {fn}(void __user **user_info) {{ return 0; }}\nEXPORT_SYMBOL({fn});")
+              declared_in_ksu_h = set()
+              for hf in h_files:
+                  ht = read(hf)
+                  for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\s*\(", ht):
+                      declared_in_ksu_h.add(m.group(1))
 
-              if extra_h:
-                  h_text = h_text.replace("#endif /* KSU_SUSFS_H */",
-                                          "\n/* Auto-synced SukiSU-Ultra symbols */\n" +
-                                          "\n".join(extra_h) + "\n\n#endif /* KSU_SUSFS_H */")
+              forward_decls = []
+              for cf in c_files:
+                  ct = read(cf)
+                  for m in re.finditer(
+                      r"(?m)^[ \t]*((?:static\s+)?(?:inline\s+)?(?:bool|int|void|u32|long|ssize_t|char\s*\*))\s+(susfs_[a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*\{",
+                      ct,
+                  ):
+                      ret_type, fn_name, params = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+                      if fn_name in declared_in_ksu_h:
+                          continue
+                      proto = f"{ret_type} {fn_name}({params});"
+                      forward_decls.append(proto)
+                      print(f"[+] extracted forward prototype from {os.path.relpath(cf, ksu_dir)}: {proto}")
+
+              if forward_decls:
+                  h_text = read(susfs_h_path)
+                  block = "\n/* Forward declarations for SukiSU-Ultra unity build */\n" + "\n".join(forward_decls) + "\n"
+                  h_text = h_text.replace("#endif /* KSU_SUSFS_H */", block + "\n#endif /* KSU_SUSFS_H */")
                   write(susfs_h_path, h_text)
-                  c_text += "\n/* Auto-synced SukiSU-Ultra symbols */\n" + "\n".join(extra_c) + "\n"
-                  write(susfs_c_path, c_text)
-                  print("[+] auto-synced extra SukiSU symbols:", ", ".join(sorted(called)))
 
 
           def main():
@@ -1516,7 +1571,8 @@ jobs:
               write(susfs_c_path, SUSFS_C)
               print("[+] wrote include/linux/susfs_def.h, include/linux/susfs.h, fs/susfs.c")
 
-              sync_missing_sukisu_susfs_symbols(root, susfs_h_path, susfs_c_path)
+              ensure_path_umount_in_namespace(root)
+              fix_sukisu_internal_susfs_declarations(root, susfs_h_path)
 
               # Wire fs/Makefile
               fs_mk = os.path.join(root, "fs/Makefile")
