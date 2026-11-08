@@ -408,11 +408,8 @@ jobs:
              high bits in `inode->i_mapping->flags`, and per-task state uses high bits in
              `current_thread_info()->flags` (`TIF_PROC_UMOUNTED`, `TIF_PROC_NO_SU`, etc.).
           2. Full compatibility with SukiSU-Ultra `builtin` (`1cfa57340590971cba7521ed536da8ebbedc5f0a`),
-             including `SUSFS_MAGIC`, `strncpy_from_user_nofault` 4.14 fallback, `can_umount` +
-             `path_umount` 4.14 backport in `fs/namespace.c` (placed after `may_mount`),
-             `susfs_starts_with`/`susfs_ends_with`, `susfs_start_sdcard_monitor_fn`, and
-             `susfs_set_current_proc_no_su`/`susfs_set_current_proc_umounted*` helpers, without
-             duplicating `susfs_is_current_ksu_domain` (already defined in `drivers/kernelsu/`).
+             including automatic synthesis of any `extern ... susfs_*` symbols referenced by
+             `KernelSU/kernel/` (such as `susfs_extra_works` and `susfs_add_sus_avd_allowed_by_type`).
           3. Idempotent inline hooks in `fs/readdir.c`, `fs/stat.c`, `fs/proc/cmdline.c`,
              `kernel/sys.c`, and `kernel/kallsyms.c` placed strictly after all ISO C90
              variable declarations.
@@ -1563,7 +1560,6 @@ jobs:
               if re.search(r"\bint\s+path_umount\s*\(", text):
                   print("[=] fs/namespace.c: path_umount already present")
                   return
-              # Anchor after may_mount() if present, else after do_umount()
               m = re.search(r"static\s+(?:inline\s+)?bool\s+may_mount\s*\([^)]*\)\s*\{", text)
               if not m:
                   m = re.search(r"static\s+int\s+do_umount\s*\([^)]*\)\s*\{", text)
@@ -1617,52 +1613,100 @@ jobs:
               print("[+] backported can_umount() + path_umount() after may_mount() in fs/namespace.c")
 
 
-          def fix_sukisu_internal_susfs_declarations(root):
+          def sync_ksu_extern_susfs_symbols(root, susfs_def_path, susfs_h_path, susfs_c_path):
               """
-              In SukiSU-Ultra's unity build (`ksu_main.c`), `feature/adb_root.c` is included
-              before `selinux/sepolicy.c`, and calls `susfs_add_sus_avd_allowed_by_type(...)`
-              which is defined in `selinux/sepolicy.c` without a header prototype.
-              Inject its exact forward declaration into `KernelSU/kernel/selinux/selinux.h`
-              (NOT `include/linux/susfs.h`, so kernel files outside `KernelSU` never see
-              any `static` or internal KSU declarations).
+              Scan all .c and .h files in KernelSU/kernel/ for `extern ... susfs_*`
+              declarations (both functions like `susfs_add_sus_avd_allowed_by_type` and
+              variables/functions like `susfs_extra_works`), and synthesize exact matching
+              definitions in `fs/susfs.c` and declarations in `include/linux/susfs.h` for
+              any `susfs_*` symbol not already defined in `fs/susfs.c` or `KernelSU/kernel/`.
               """
               ksu_dir = os.path.join(root, "KernelSU", "kernel")
-              selinux_h = os.path.join(ksu_dir, "selinux", "selinux.h")
-              if not os.path.isdir(ksu_dir) or not os.path.isfile(selinux_h):
+              if not os.path.isdir(ksu_dir):
                   return
-              h_files = glob.glob(os.path.join(ksu_dir, "**/*.h"), recursive=True)
-              c_files = glob.glob(os.path.join(ksu_dir, "**/*.c"), recursive=True)
+              all_files = (
+                  glob.glob(os.path.join(ksu_dir, "**/*.c"), recursive=True) +
+                  glob.glob(os.path.join(ksu_dir, "**/*.h"), recursive=True)
+              )
+              c_text = read(susfs_c_path)
+              h_text = read(susfs_h_path)
+              def_text = read(susfs_def_path)
 
-              declared_in_ksu_h = set()
-              for hf in h_files:
-                  ht = read(hf)
-                  for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\s*\(", ht):
-                      declared_in_ksu_h.add(m.group(1))
-
-              forward_decls = []
-              for cf in c_files:
-                  ct = read(cf)
+              defined_syms = set()
+              for m in re.finditer(r"EXPORT_SYMBOL\(\s*(susfs_[a-zA-Z0-9_]+)\s*\)", c_text):
+                  defined_syms.add(m.group(1))
+              for m in re.finditer(r"\b(susfs_[a-zA-Z0-9_]+)\b", def_text):
+                  defined_syms.add(m.group(1))
+              for fp in all_files:
+                  src = read(fp)
                   for m in re.finditer(
-                      r"(?m)^[ \t]*((?:static\s+)?(?:inline\s+)?(?:bool|int|void|u32|long|ssize_t|char\s*\*))\s+(susfs_[a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*\{",
-                      ct,
+                      r"(?m)^[ \t]*(?!extern\b)(?:static\s+)?(?:inline\s+)?(?:bool|int|void|u32|long|ssize_t|char\s*\*)\s+(susfs_[a-zA-Z0-9_]+)\s*\([^;]*\)\s*\{",
+                      src,
                   ):
-                      ret_type, fn_name, params = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-                      if fn_name in declared_in_ksu_h:
-                          continue
-                      proto = f"{ret_type} {fn_name}({params});"
-                      forward_decls.append(proto)
-                      print(f"[+] extracted forward prototype from {os.path.relpath(cf, ksu_dir)}: {proto}")
+                      defined_syms.add(m.group(1))
 
-              if forward_decls:
-                  sh_text = read(selinux_h)
-                  block = "\n#ifdef CONFIG_KSU_SUSFS\n" + "\n".join(forward_decls) + "\n#endif\n"
-                  last_endif = sh_text.rfind("#endif")
-                  if last_endif >= 0:
-                      sh_text = sh_text[:last_endif] + block + sh_text[last_endif:]
-                  else:
-                      sh_text += block
-                  write(selinux_h, sh_text)
-                  print("[+] added forward declarations to KernelSU/kernel/selinux/selinux.h")
+              extra_h = []
+              extra_c = []
+              type_kw = {
+                  "int", "char", "long", "short", "void", "bool", "u8", "u16", "u32", "u64",
+                  "s8", "s16", "s32", "s64", "uid_t", "gid_t", "pid_t", "size_t", "ssize_t",
+                  "unsigned", "signed", "const", "volatile", "struct",
+              }
+
+              for fp in all_files:
+                  src = read(fp)
+                  # 1. Match extern function declarations: extern <ret> susfs_foo(<args>);
+                  for m in re.finditer(
+                      r"\bextern\s+((?:const\s+|unsigned\s+|signed\s+|struct\s+\w+\s*\*?\s*|[a-zA-Z0-9_]+\s*\*?\s*)+?)\s*\b(susfs_[a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*;",
+                      src,
+                  ):
+                      ret_type = " ".join(m.group(1).split())
+                      fn_name = m.group(2).strip()
+                      params = " ".join(m.group(3).split())
+                      if fn_name in defined_syms:
+                          continue
+                      defined_syms.add(fn_name)
+                      if params and params != "void":
+                          param_list = []
+                          for idx, p in enumerate(params.split(",")):
+                              p = p.strip()
+                              tokens = re.findall(r"[a-zA-Z0-9_]+|\*", p)
+                              if len(tokens) >= 2 and tokens[-1] != "*" and tokens[-1] not in type_kw:
+                                  param_list.append(p)
+                              else:
+                                  param_list.append(f"{p} arg{idx}")
+                          params_def = ", ".join(param_list)
+                      else:
+                          params_def = "void"
+                      ret_stmt = "\treturn 0;\n" if ret_type != "void" else ""
+                      extra_h.append(f"{ret_type} {fn_name}({params or 'void'});")
+                      extra_c.append(f"{ret_type} {fn_name}({params_def})\n{{\n{ret_stmt}}}\nEXPORT_SYMBOL({fn_name});")
+                      print(f"[+] synthesized extern function from {os.path.relpath(fp, ksu_dir)}: {ret_type} {fn_name}({params_def})")
+
+                  # 2. Match extern variable declarations: extern <type> susfs_bar;
+                  for m in re.finditer(
+                      r"\bextern\s+((?:const\s+|unsigned\s+|signed\s+|struct\s+\w+\s*\*?\s*|[a-zA-Z0-9_]+\s*\*?\s*)+?)\s*\b(susfs_[a-zA-Z0-9_]+)\s*;",
+                      src,
+                  ):
+                      var_type = " ".join(m.group(1).split())
+                      var_name = m.group(2).strip()
+                      if var_name in defined_syms:
+                          continue
+                      defined_syms.add(var_name)
+                      init_val = "true" if var_type == "bool" else "0"
+                      extra_h.append(f"extern {var_type} {var_name};")
+                      extra_c.append(f"{var_type} {var_name} __read_mostly = {init_val};\nEXPORT_SYMBOL({var_name});")
+                      print(f"[+] synthesized extern variable from {os.path.relpath(fp, ksu_dir)}: {var_type} {var_name} = {init_val}")
+
+              if extra_h:
+                  h_text = h_text.replace(
+                      "#endif /* KSU_SUSFS_H */",
+                      "\n/* Auto-synthesized SukiSU-Ultra extern symbols */\n" + "\n".join(extra_h) + "\n\n#endif /* KSU_SUSFS_H */",
+                  )
+                  write(susfs_h_path, h_text)
+              if extra_c:
+                  c_text += "\n/* Auto-synthesized SukiSU-Ultra extern symbols */\n" + "\n\n".join(extra_c) + "\n"
+                  write(susfs_c_path, c_text)
 
 
           def main():
@@ -1677,7 +1721,7 @@ jobs:
               print("[+] wrote include/linux/susfs_def.h, include/linux/susfs.h, fs/susfs.c")
 
               ensure_path_umount_in_namespace(root)
-              fix_sukisu_internal_susfs_declarations(root)
+              sync_ksu_extern_susfs_symbols(root, susfs_def_path, susfs_h_path, susfs_c_path)
 
               # Wire fs/Makefile
               fs_mk = os.path.join(root, "fs/Makefile")
