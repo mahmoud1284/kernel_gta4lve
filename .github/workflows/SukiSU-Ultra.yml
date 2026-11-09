@@ -146,7 +146,7 @@ jobs:
           --- a/kernel/ksu_main.c
           +++ b/kernel/ksu_main.c
           @@ -77,7 +77,8 @@
-           
+ 
            // unity build
            #include "extension/extension.c"
           -#include "extension/cpu_spoof.c"
@@ -167,31 +167,46 @@ jobs:
                susfs_parse_priority_app_strings();
           +#endif
            }
-           
+ 
            // Never scan from the fsnotify handler: fsnotify_mark_srcu and the rename's dir
           @@ -34,7 +36,9 @@ static void ksu_defer_track_throne(void)
                struct callback_head *cb;
-           
+ 
                // Renew the getpriority uid bitmap filter
           +#ifdef CONFIG_KSU_SUSFS
                susfs_parse_priority_app_strings();
           +#endif
-           
+ 
                if (!(current->flags & PF_KTHREAD)) {
                    cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+          diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+          index 3d5b86e9..a8fed10f 100644
+          --- a/kernel/selinux/rules.c
+          +++ b/kernel/selinux/rules.c
+          @@ -255,6 +255,10 @@ do_stop_machine:
+           out_flush:
+               smp_mb();
+               reset_avc_cache();
+          +#ifdef CONFIG_KSU_SUSFS
+          +    /* pre-5.10 path never populated the SUSFS SIDs: setresuid hook then never matched zygote */
+          +    susfs_set_batch_sid();
+          +#endif
+           #endif
+           }
+ 
           diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
           index 4948cdfa..11d2b827 100644
           --- a/kernel/sulog/event.c
           +++ b/kernel/sulog/event.c
           @@ -140,7 +140,7 @@ static __u32 ksu_sulog_flatten_argv(struct user_arg_ptr *argv_user, char *dst, _
                        return ksu_sulog_copy_empty_string(dst);
-           
+ 
                    copied =
           -            strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
           +            ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
                    if (copied <= 0)
                        return ksu_sulog_copy_empty_string(dst);
-           
+ 
           diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
           index 9a94512b..8ea2eb5e 100644
           --- a/kernel/supercall/dispatch.c
@@ -199,7 +214,7 @@ jobs:
           @@ -619,8 +619,8 @@ static int do_lookup_symbols(void __user *arg)
                if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
                    return -EINVAL;
-           
+ 
           -    names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
           -    addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
           +    names = kvzalloc(cmd.count * sizeof(*names), GFP_KERNEL);
