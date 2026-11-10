@@ -1,4 +1,4 @@
-name: Build gta4lve + SukiSU-Ultra + SUSFS + NoMount
+name: Build Downgrade
 
 # Separate from build-kernelsu-next.yml (that one is untouched).
 # SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
