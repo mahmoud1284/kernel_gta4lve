@@ -1,0 +1,1225 @@
+name: Build gta4lve + SukiSU-Ultra + SUSFS + NoMount
+
+# Separate from build-kernelsu-next.yml (that one is untouched).
+# SukiSU-Ultra `builtin` branch = manual hooks (no kprobes), ported to 4.14 by a small
+# compat patch (.github/patches is NOT needed: the patch is embedded below).
+# All third-party integration points are pinned and verified before compilation.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      suki_ref:
+        description: "SukiSU-Ultra commit (builtin branch). Default = the commit the 4.14 compat patch was written/tested against. Other commits may fail to patch"
+        required: true
+        default: "1cfa57340590971cba7521ed536da8ebbedc5f0a"
+      downgrade_186:
+        description: "Really downgrade the source tree from 4.14.199 to 4.14.186 (reverts stable 187..199 patches; net/cgroup/xattr kept at 199 for module ABI). Needs .github/patches/downgrade-4.14.199-to-4.14.186.patch"
+        type: boolean
+        default: true
+      sublevel:
+        description: "Override SUBLEVEL in Makefile (version string only). Empty = keep source value (186 after downgrade)"
+        required: false
+        default: ""
+      force_module:
+        description: "Enable CONFIG_MODULE_FORCE_LOAD + CONFIG_MODULE_FORCE_UNLOAD"
+        type: boolean
+        default: true
+      enable_kpm:
+        description: "CONFIG_KPM (SukiSU's built-in KPM bridge). NOTE: still needs KernelPatch patched into the boot image to actually load KPMs"
+        type: boolean
+        # KPM requires a KernelPatch-patched boot image; keep it off for the baseline.
+        default: false
+      enable_susfs:
+        description: "Enable full SUSFS v2.3.0 profile (all supported features)"
+        type: boolean
+        default: true
+      enable_nomount:
+        description: "Integrate NoMount (maxsteeel/nomount) as built-in CONFIG_NOMOUNT=y"
+        type: boolean
+        default: true
+      enable_ksu:
+        description: "Integrate SukiSU-Ultra. Turn OFF to build a plain baseline kernel (boot test)"
+        type: boolean
+        default: true
+
+env:
+  DEFCONFIG: gta4lve_eur_open_defconfig
+
+jobs:
+  build:
+    name: Build kernel (SukiSU-Ultra + optional SUSFS/NoMount)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential curl git zip unzip xz-utils lz4 cpio \
+            python3 device-tree-compiler ca-certificates libyaml-dev
+
+      - name: Download toolchains (AOSP clang r383902b + GCC 4.9)
+        run: |
+          set -e
+          mkdir -p "$HOME/tc/clang" "$HOME/tc/gcc64"
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            "$HOME/tc/gcc64"
+
+          got=0
+          for ref in android11-release android11-qpr1-release android11-qpr2-release android11-qpr3-release android12-release mirror-goog-main-llvm-toolchain-source; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${ref}/clang-r383902b.tar.gz"
+            echo "trying $url"
+            if curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/clang.tgz" \
+               && tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$HOME/tc/clang" \
+               && [ -x "$HOME/tc/clang/bin/clang" ]; then
+              got=1
+              echo "clang from branch: $ref"
+              break
+            fi
+            rm -rf "$HOME/tc/clang"/* || true
+          done
+
+          if [ "$got" != "1" ]; then
+            echo "::warning::AOSP clang r383902b not downloadable, falling back to Proton clang"
+            rm -rf "$HOME/tc/clang"
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "$HOME/tc/clang"
+          fi
+
+          "$HOME/tc/clang/bin/clang" --version | head -1
+          echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Downgrade source 4.14.199 -> 4.14.186
+        if: ${{ inputs.downgrade_186 }}
+        run: |
+          set -e
+          P=.github/patches/downgrade-4.14.199-to-4.14.186.patch
+          test -f "$P" || { echo "::error::$P missing - upload it to the repo"; exit 1; }
+          grep -E '^SUBLEVEL' Makefile
+          if [ "$(sed -n 's/^SUBLEVEL = //p' Makefile)" != "199" ]; then
+            echo "::error::source is not 4.14.199, refusing to apply downgrade"; exit 1
+          fi
+          git apply --check "$P"
+          git apply --whitespace=nowarn "$P"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' '; echo
+
+      - name: Integrate SukiSU-Ultra
+        if: ${{ inputs.enable_ksu }}
+        env:
+          SUKI_REF: ${{ inputs.suki_ref }}
+        run: |
+          set -e
+          # setup.sh clones SukiSU-Ultra into ./KernelSU, checks out $SUKI_REF,
+          # symlinks drivers/kernelsu and wires drivers/Makefile + drivers/Kconfig.
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKI_REF}/kernel/setup.sh" \
+            | bash -s "${SUKI_REF}"
+          test -L drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile
+          grep -q "kernelsu/Kconfig" drivers/Kconfig
+          echo "SukiSU-Ultra commit: $(git -C KernelSU rev-parse HEAD)"
+
+          # --- 4.14 compat patch (static_call.h, cpu_spoof/vdso, access_ok, kvcalloc, SUSFS-only call) ---
+          cat > "$RUNNER_TEMP/sukisu-4.14-compat.patch" <<'PATCHEOF'
+          diff --git a/kernel/extension/kpm/kpm.c b/kernel/extension/kpm/kpm.c
+          index 5735c2d3..b7debdf4 100644
+          --- a/kernel/extension/kpm/kpm.c
+          +++ b/kernel/extension/kpm/kpm.c
+          @@ -179,7 +179,7 @@ int do_kpm(void __user *arg)
+               int result;
+               /* Called only through the manager_or_root-authorized extension ioctl. */
+               if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
+          -    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
+          +    if (!ksu_access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
+               result = handle_kpm(&cmd);
+               return copy_to_user(u64_to_user_ptr(cmd.result_code), &result, sizeof(result)) ? -EFAULT : 0;
+           }
+          diff --git a/kernel/kernel_includes.h b/kernel/kernel_includes.h
+          index 422fde3d..a5168fa1 100644
+          --- a/kernel/kernel_includes.h
+          +++ b/kernel/kernel_includes.h
+          @@ -73,7 +73,9 @@
+           #include <linux/vmalloc.h>
+           #include <linux/tty.h>
+           #include <linux/kref.h>
+          +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+           #include <linux/static_call.h>
+          +#endif
+           #include "arch.h"
+           #ifdef CONFIG_KSU_SUSFS
+           #include <linux/susfs.h>
+          diff --git a/kernel/ksu_main.c b/kernel/ksu_main.c
+          index 8b1272d5..a55df22f 100644
+          --- a/kernel/ksu_main.c
+          +++ b/kernel/ksu_main.c
+          @@ -77,7 +77,8 @@
+ 
+           // unity build
+           #include "extension/extension.c"
+          -#include "extension/cpu_spoof.c"
+          +/* 4.14: cpu_spoof needs vdso/datapage.h (5.x only); not needed for root/KPM -> stub */
+          +int ksu_extension_cpu_spoof_io(u32 id, void __user *raw) { return -EOPNOTSUPP; }
+           #include "extension/umount_paths.c"
+           #include "extension/dynamic_manager.c"
+           #include "extension/kpm.c"
+          diff --git a/kernel/manager/pkg_observer.c b/kernel/manager/pkg_observer.c
+          index 9082a6de..acbd8deb 100644
+          --- a/kernel/manager/pkg_observer.c
+          +++ b/kernel/manager/pkg_observer.c
+          @@ -21,7 +21,9 @@ static void ksu_track_throne_tw_func(struct callback_head *cb)
+                   return;
+               track_throne(false);
+               // Renew the priority uid bitmap filter
+          +#ifdef CONFIG_KSU_SUSFS
+               susfs_parse_priority_app_strings();
+          +#endif
+           }
+ 
+           // Never scan from the fsnotify handler: fsnotify_mark_srcu and the rename's dir
+          @@ -34,7 +36,9 @@ static void ksu_defer_track_throne(void)
+               struct callback_head *cb;
+ 
+               // Renew the getpriority uid bitmap filter
+          +#ifdef CONFIG_KSU_SUSFS
+               susfs_parse_priority_app_strings();
+          +#endif
+ 
+               if (!(current->flags & PF_KTHREAD)) {
+                   cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+          diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+          index 3d5b86e9..a8fed10f 100644
+          --- a/kernel/selinux/rules.c
+          +++ b/kernel/selinux/rules.c
+          @@ -255,6 +255,10 @@ do_stop_machine:
+           out_flush:
+               smp_mb();
+               reset_avc_cache();
+          +#ifdef CONFIG_KSU_SUSFS
+          +    /* pre-5.10 path never populated the SUSFS SIDs: setresuid hook then never matched zygote */
+          +    susfs_set_batch_sid();
+          +#endif
+           #endif
+           }
+ 
+          diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
+          index 4948cdfa..11d2b827 100644
+          --- a/kernel/sulog/event.c
+          +++ b/kernel/sulog/event.c
+          @@ -140,7 +140,7 @@ static __u32 ksu_sulog_flatten_argv(struct user_arg_ptr *argv_user, char *dst, _
+                       return ksu_sulog_copy_empty_string(dst);
+ 
+                   copied =
+          -            strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
+          +            ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
+                   if (copied <= 0)
+                       return ksu_sulog_copy_empty_string(dst);
+ 
+          diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+          index 9a94512b..8ea2eb5e 100644
+          --- a/kernel/supercall/dispatch.c
+          +++ b/kernel/supercall/dispatch.c
+          @@ -619,8 +619,8 @@ static int do_lookup_symbols(void __user *arg)
+               if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
+                   return -EINVAL;
+ 
+          -    names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
+          -    addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
+          +    names = kvzalloc(cmd.count * sizeof(*names), GFP_KERNEL);
+          +    addrs = kvzalloc(cmd.count * sizeof(*addrs), GFP_KERNEL);
+               if (!names || !addrs) {
+                   ret = -ENOMEM;
+                   goto out;
+          PATCHEOF
+          if ! git -C KernelSU apply --check "$RUNNER_TEMP/sukisu-4.14-compat.patch"; then
+            echo "::error::4.14 compat patch does not apply to SukiSU commit ${SUKI_REF}. Use the default pinned commit."
+            exit 1
+          fi
+          git -C KernelSU apply "$RUNNER_TEMP/sukisu-4.14-compat.patch"
+
+          # Linux 4.14 exports sys_close(), not ksys_close(). The newer SukiSU
+          # preinit source selects ksys_close for every kernel older than 5.11;
+          # use the 4.14 syscall entry point so preinit.o can compile and ksud
+          # can be launched during early boot.
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path("KernelSU/kernel/preinit/preinit.c")
+          s = p.read_text()
+          old = "#define ksu_close_fd_compat(fd) ksys_close(fd)"
+          new = "#define ksu_close_fd_compat(fd) sys_close(fd)"
+          if s.count(old) != 1:
+              raise SystemExit("expected one ksys_close compatibility macro")
+          p.write_text(s.replace(old, new, 1))
+          PYFIX
+          grep -n 'ksu_close_fd_compat' KernelSU/kernel/preinit/preinit.c
+
+          # The embedded runner from newer SukiSU assumes newer UAPI headers:
+          # Linux 4.14 has no clone3/struct clone_args and has no linux/mount.h.
+          # Keep preinit enabled, but use the legacy clone syscall and fs.h flags.
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          sys_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys.h")
+          s = sys_h.read_text()
+          fn_start = s.index("pid_t sys_vfork(void)")
+          start = s.index("/*", fn_start)
+          end_call = s.index("my_syscall2(__NR_clone3", start)
+          end = s.index("\n", end_call)
+          replacement = ("\t/* Linux 4.14 has clone() but not clone3(). */\n"
+                         "#if defined(__NR_clone)\n"
+                         "\treturn my_syscall5(__NR_clone,\n"
+                         "\t\tCLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0);\n"
+                         "#else\n"
+                         "\treturn -ENOSYS;\n"
+                         "#endif")
+          sys_h.write_text(s[:start] + replacement + s[end:])
+          mount_h = Path("KernelSU/kernel/preinit/runner/nolibc/sys/mount.h")
+          s = mount_h.read_text()
+          if s.count("#include <linux/mount.h>") != 1:
+              raise SystemExit("linux/mount.h include not found")
+          mount_h.write_text(s.replace("#include <linux/mount.h>", "#include <linux/fs.h>", 1))
+
+          time_h = Path("KernelSU/kernel/preinit/runner/nolibc/time.h")
+          s = time_h.read_text()
+          marker = "#include <linux/time.h>\n"
+          compat = marker + (
+                    "\n/* Linux 4.14 UAPI has no __kernel_timespec type. */\n"
+                    "#ifndef __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
+                    "#define __KERNEL_TIMESPEC_COMPAT_DEFINED\n"
+                    "struct __kernel_timespec { __s64 tv_sec; long tv_nsec; };\n"
+                    "#endif\n")
+          if s.count(marker) != 1:
+              raise SystemExit("linux/time.h include not found")
+          if "struct __kernel_timespec {" not in s:
+              time_h.write_text(s.replace(marker, compat, 1))
+          else:
+              raise SystemExit("unexpected existing __kernel_timespec definition")
+          PYFIX
+          ! grep -RInE 'struct clone_args|__NR_clone3|<linux/mount.h>' KernelSU/kernel/preinit/runner/nolibc
+          echo "compat patch applied"
+
+          # clang (-Werror) rejects two harmless things in SukiSU on this toolchain:
+          # 'KSU_NO_PREINIT' macro redefined, and unused variables in selinux/rules.c.
+          # Don't let warnings in the SukiSU driver fail the build.
+          printf '\nccflags-y += -Wno-error\n' >> KernelSU/kernel/Makefile
+
+      - name: Apply SUSFS v2.3.0 kernel patch (ported to 4.14)
+        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
+        run: |
+          set -e
+          # SUSFS v2.3.0 (core: fs/susfs.c + headers, from wxx9248/susfs4ksu `kernel-4.9-v2`)
+          # hand-ported to this Samsung 4.14 tree. It also carries the SukiSU hook calls
+          # (execve/faccessat/stat/read/reboot/setresuid/input), so the plain manual-hooks
+          # step is skipped. It does NOT touch struct seccomp / struct vfsmount / task_struct.
+          # (gzip+base64 only to keep this file small; the .patch is delivered next to it)
+          base64 -d > "$RUNNER_TEMP/susfs.patch.gz" <<'B64EOF'
+          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
+          Y4APAgA=
+          B64EOF
+          gunzip -f "$RUNNER_TEMP/susfs.patch.gz"
+          echo "40f2802790bd5f863d87ce6a0e27d962e87f51718323199c4abd2e6574ed84b4  $RUNNER_TEMP/susfs.patch" | sha256sum -c -
+          # Refuse fuzzed/partial application; this avoids silently producing a kernel
+          # with only part of the SUSFS hook set.
+          patch --dry-run --forward --batch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
+          patch --forward --batch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs.patch"
+          test -f fs/susfs.c && test -f include/linux/susfs.h
+          grep -q "susfs.o" fs/Makefile
+          echo "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
+
+      - name: Fix SUSFS C90 declaration order for Clang 4.14 build
+        if: ${{ inputs.enable_ksu && inputs.enable_susfs }}
+        run: |
+          set -e
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path("fs/namei.c")
+          s = p.read_text()
+          start = s.index("static int do_last(")
+          end = s.index("\n}\n", start) + 3
+          fn = s[start:end]
+          block = "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\tnd->state |= ND_STATE_OPEN_LAST;\n#endif\n"
+          if block not in fn:
+              raise SystemExit("do_last SUSFS state block not found")
+          fn = fn.replace(block, "", 1)
+          anchor = "\tint error;\n"
+          if anchor not in fn:
+              raise SystemExit("do_last declaration anchor not found")
+          fn = fn.replace(anchor, anchor + block, 1)
+          p.write_text(s[:start] + fn + s[end:])
+          PYFIX
+          sed -n '/static int do_last(/,/^}/p' fs/namei.c | head -28
+      - name: Apply SukiSU manual hooks (only when SUSFS is off)
+        if: ${{ inputs.enable_ksu && !inputs.enable_susfs }}
+        run: |
+          cat > "$RUNNER_TEMP/ksu_manual_hooks_suki.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Apply SukiSU-Ultra (`builtin` branch) *manual hooks* to a Linux 4.14 arm64 kernel tree.
+
+          Usage:  python3 ksu_manual_hooks_suki.py <kernel-root>
+
+          - Idempotent: running it twice changes nothing the second time.
+          - Strict: if an anchor is not found (source drifted) it exits with an error instead of
+            silently producing a kernel without a hook.
+          - Every call is wrapped in `#ifdef CONFIG_KSU`, so CONFIG_KSU=n gives the stock kernel.
+          - Setuid / umount handling is done by SukiSU through an LSM hook, so no kernel patch is
+            needed for those. SUSFS is NOT supported here (it needs a large kernel patch set).
+          """
+          import os
+          import re
+          import sys
+
+          HEADER_PATH = "include/linux/ksu_hooks.h"
+          HEADER = r"""/* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_KSU_HOOKS_H
+          #define _LINUX_KSU_HOOKS_H
+
+          #include <linux/types.h>
+          #include <linux/compiler.h>
+
+          struct filename;
+          struct file;
+
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          			       void *argv, void *envp, int *flags);
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          				int *mode, int *__unused_flags);
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+          			   int *flags);
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+          			       size_t *count_ptr, loff_t **pos);
+          extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+          				 void __user **arg);
+          #endif /* CONFIG_KSU */
+
+          #endif /* _LINUX_KSU_HOOKS_H */
+          """
+
+          INCLUDE_LINE = "#include <linux/ksu_hooks.h>\n"
+
+          # (file, function signature, anchor, mode, hook call text)
+          HOOKS = [
+              ("fs/exec.c",
+               "static int do_execveat_common(int fd, struct filename *filename,",
+               "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n",
+               "after",
+               "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"),
+
+              ("fs/open.c",
+               "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+               "\tif (mode & ~S_IRWXO)",
+               "before",
+               "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+               "\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+               "before",
+               "ksu_handle_stat(&dfd, &filename, &flag);"),
+
+              ("fs/stat.c",
+               "SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)",
+               "\tif (!error)\n\t\terror = cp_new_stat(&stat, statbuf);",
+               "before",
+               "if (!error)\n\t\tksu_handle_vfs_fstat(fd, &stat.size);"),
+
+              ("fs/read_write.c",
+               "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)",
+               "\tif (!(file->f_mode & FMODE_READ))",
+               "before",
+               "ksu_handle_vfs_read(&file, &buf, &count, &pos);"),
+
+              ("kernel/reboot.c",
+               "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+               "\t/* We only trust the superuser with rebooting the system. */",
+               "before",
+               "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"),
+          ]
+
+
+          def die(msg):
+              print("ERROR: " + msg, file=sys.stderr)
+              sys.exit(1)
+
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def write(path, text):
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(text)
+
+
+          def ensure_include(root, rel):
+              path = os.path.join(root, rel)
+              text = read(path)
+              if INCLUDE_LINE in text:
+                  return False
+              idx = text.find("\n#include ")
+              if idx < 0:
+                  die("%s: no #include line found" % rel)
+              idx += 1
+              eol = text.find("\n", idx) + 1
+              write(path, text[:eol] + INCLUDE_LINE + text[eol:])
+              return True
+
+
+          def apply_hook(root, rel, func_sig, anchor, mode, call):
+              path = os.path.join(root, rel)
+              text = read(path)
+
+              if text.count(func_sig) != 1:
+                  die("%s: function signature found %d times (expected 1):\n  %s"
+                      % (rel, text.count(func_sig), func_sig))
+              start = text.index(func_sig)
+              end = text.find("\n}\n", start)
+              if end < 0:
+                  die("%s: end of function not found: %s" % (rel, func_sig))
+
+              if call in text[start:end]:
+                  return False  # already patched
+
+              a = text.find(anchor, start)
+              if a < 0 or a > end:
+                  die("%s: anchor not found inside function:\n  %s\n  anchor: %r"
+                      % (rel, func_sig, anchor))
+
+              block = "#ifdef CONFIG_KSU\n\t%s\n#endif\n" % call
+              pos = a if mode == "before" else a + len(anchor)
+              write(path, text[:pos] + block + text[pos:])
+              return True
+
+
+          def main():
+              if len(sys.argv) != 2:
+                  die("usage: ksu_manual_hooks_suki.py <kernel-root>")
+              root = os.path.abspath(sys.argv[1])
+              if not os.path.isfile(os.path.join(root, "Makefile")):
+                  die("%s does not look like a kernel tree" % root)
+
+              hdr = os.path.join(root, HEADER_PATH)
+              if not os.path.isfile(hdr) or read(hdr) != HEADER:
+                  write(hdr, HEADER)
+                  print("[+] wrote " + HEADER_PATH)
+              else:
+                  print("[=] " + HEADER_PATH + " already present")
+
+              for rel in sorted({h[0] for h in HOOKS}):
+                  if ensure_include(root, rel):
+                      print("[+] %s: added #include <linux/ksu_hooks.h>" % rel)
+
+              for rel, func_sig, anchor, mode, call in HOOKS:
+                  name = re.search(r"ksu_[a-z_]+", call).group(0)
+                  if apply_hook(root, rel, func_sig, anchor, mode, call):
+                      print("[+] %s: hooked %s" % (rel, name))
+                  else:
+                      print("[=] %s: %s already hooked" % (rel, name))
+
+              print("[+] done")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -I "$RUNNER_TEMP/ksu_manual_hooks_suki.py" .
+
+      - name: Integrate NoMount
+        if: ${{ inputs.enable_nomount }}
+        env:
+          NOMOUNT_REF: bf1847f98fed382369c43bfd652cd93774b9b8e3   # v2.2.0, tested to compile on 4.14
+        run: |
+          set -e
+          # setup.sh clones NoMount into ./NoMount, symlinks fs/nomount -> kernel/src and
+          # wires fs/Makefile + fs/Kconfig. NoMount is self-contained (no kernel hooks, no
+          # struct changes), so it does not touch the module CRCs.
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_REF}/kernel/setup.sh" \
+            | bash -s "${NOMOUNT_REF}"
+          test -L fs/nomount
+          grep -q "nomount" fs/Makefile
+          grep -q "fs/nomount/Kconfig" fs/Kconfig
+          echo "NoMount commit: $(git -C NoMount rev-parse HEAD)"
+
+      - name: Override kernel version string (optional)
+        if: ${{ inputs.sublevel != '' }}
+        env:
+          SUBLEVEL_NEW: ${{ inputs.sublevel }}
+        run: |
+          set -e
+          echo "Before: $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_NEW}/" Makefile
+          echo "After:  $(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | tr -d ' ' | tr '\n' ' ')"
+
+      - name: Initialize build log
+        run: |
+          : > build.log
+          echo "Build log initialized at $(date -u +%FT%TZ)"
+
+      - name: Configure
+        env:
+          FORCE_MODULE: ${{ inputs.force_module }}
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+          ENABLE_KPM: ${{ inputs.enable_kpm }}
+          ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
+        run: |
+          set -e
+          # Capture configuration/preparation failures too; Build kernel may not run.
+          exec > >(tee -a build.log) 2>&1
+          export BSP_BUILD_FAMILY=qogirl6
+          export BSP_BUILD_ANDROID_OS=y
+          export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+          # DTC_OVERLAY_VTS_EXT intentionally NOT set (tools/lib64/*.so are Git LFS pointers).
+
+          {
+            echo "BSP_BUILD_FAMILY=qogirl6"
+            echo "BSP_BUILD_ANDROID_OS=y"
+            echo "DTC_OVERLAY_TEST_EXT=$DTC_OVERLAY_TEST_EXT"
+            echo "KMAKE=make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+          } >> "$GITHUB_ENV"
+
+          KMAKE="make -j$(nproc) O=out ARCH=arm64 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$HOME/tc/gcc64/bin/aarch64-linux-android- HOSTLOADLIBES_dtc=-lyaml"
+
+          # SukiSU's Makefile enables its preinit runner only when the generated
+          # UAPI header exists while the driver Makefile is parsed. Generate it
+          # before defconfig/build; otherwise KSU_NO_PREINIT is defined and ksud
+          # never gets the early userspace hand-off on this non-GKI 4.14 device.
+          if [ "$ENABLE_KSU" = "true" ]; then
+            $KMAKE headers_install
+            test -f out/usr/include/linux/unistd.h
+          fi
+
+          $KMAKE "$DEFCONFIG"
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            scripts/config --file out/.config -e KSU
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              # Full SUSFS profile: enable every SUSFS option exposed by the
+              # SukiSU builtin commit and implemented by the v2.3.0 kernel patch.
+              scripts/config --file out/.config -e KSU_SUSFS \
+                -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+                -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+                -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP \
+                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            else
+              scripts/config --file out/.config -d KSU_SUSFS
+            fi
+            if [ "$ENABLE_KPM" = "true" ]; then
+              scripts/config --file out/.config -e KPM
+            else
+              scripts/config --file out/.config -d KPM
+            fi
+          fi
+          if [ "$ENABLE_NOMOUNT" = "true" ]; then
+            scripts/config --file out/.config -e NOMOUNT
+          fi
+          if [ "$FORCE_MODULE" = "true" ]; then
+            scripts/config --file out/.config -e MODULE_FORCE_LOAD -e MODULE_FORCE_UNLOAD
+          fi
+          $KMAKE olddefconfig
+
+          echo "---- resulting config ----"
+          grep -E '^(# )?CONFIG_(KSU[A-Z_]*|KPM|NOMOUNT|KEYS|THREAD_INFO_IN_TASK|KPROBES|KALLSYMS|KALLSYMS_ALL|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|MODULE_FORCE_UNLOAD|MODVERSIONS|MODULE_SIG)[ =]' out/.config || true
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+              for opt in \
+                KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
+                KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG \
+                KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+                grep -q "^CONFIG_${opt}=y" out/.config || { echo "::error::CONFIG_${opt} was not enabled"; exit 1; }
+              done
+            elif grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+              echo "::error::KSU_SUSFS is enabled but SUSFS is not integrated"; exit 1
+            fi
+            if [ "$ENABLE_KPM" = "true" ]; then grep -q '^CONFIG_KPM=y' out/.config; fi
+          fi
+          if [ "$ENABLE_NOMOUNT" = "true" ]; then
+            grep -q '^CONFIG_NOMOUNT=y' out/.config
+            grep -q '^CONFIG_KEYS=y' out/.config   # NoMount talks to userspace through the keyring
+          fi
+          if [ "$FORCE_MODULE" = "true" ]; then
+            grep -q '^CONFIG_MODULE_FORCE_LOAD=y' out/.config
+          fi
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
+
+      - name: Pre-generate include/generated/compile.h
+        if: ${{ inputs.enable_ksu }}
+        run: |
+          set -o pipefail
+          # SukiSU includes generated/compile.h; generate it before the parallel build so
+          # the driver cannot race ahead of it. Keep this output in the diagnostic log;
+          # this step runs before the main Build kernel step.
+          $KMAKE init/version.o 2>&1 | tee -a build.log
+          test -f out/include/generated/compile.h
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          $KMAKE 2>&1 | tee build.log
+
+      - name: Show real errors (only on failure)
+        if: failure()
+        run: |
+          echo "=== first errors in build.log ==="
+          if [ -s build.log ]; then
+            grep -n -E "error:|Error [0-9]|undefined reference|No hooks|fatal|\*\*\*|No such file" build.log | head -40 || true
+            echo "=== 15 lines before the first make error ==="
+            n=$(grep -n -m1 -E "error:|undefined reference|\*\*\* |No such file" build.log | cut -d: -f1); [ -n "$n" ] && sed -n "$((n>15?n-15:1)),$((n+5))p" build.log || true
+          else
+            echo "build.log is empty; failure occurred before a logged build command."
+          fi
+
+      - name: Collect output
+        env:
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+          ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
+          ENABLE_SUSFS: ${{ inputs.enable_susfs }}
+        run: |
+          set -e
+          # SukiSU must not change struct layouts (would break stock vendor modules via modversions)
+          if ! git diff --quiet -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h; then
+            echo "::error::a core header was modified (struct layout changed)"
+            git diff -- include/linux/seccomp.h include/linux/mount.h include/linux/sched.h
+            exit 1
+          fi
+          NMB="$HOME/tc/gcc64/bin/aarch64-linux-android-nm"
+          nm_has() {
+            grep -Eq " [Tt] $1$" "$SYMBOLS_FILE"
+          }
+          SYMBOLS_FILE="$RUNNER_TEMP/vmlinux.symbols"
+          "$NMB" out/vmlinux > "$SYMBOLS_FILE"
+          if [ "$ENABLE_NOMOUNT" = "true" ]; then
+            # NoMount has changed its internal symbol set across releases; validate the
+            # stable built-in entry point instead of counting incidental symbols.
+            if ! nm_has nomount_init; then
+              echo "::error::NoMount was enabled but nomount_init is missing from vmlinux"
+              exit 1
+            fi
+            echo "NoMount symbol: nomount_init"
+          fi
+          if [ "$ENABLE_KSU" = "true" ]; then
+            # Validate stable entry points used by the 4.14 integration.
+            for sym in ksu_handle_execveat ksu_handle_faccessat ksu_handle_stat ksu_handle_sys_reboot; do
+              if ! nm_has "$sym"; then
+                echo "::error::SukiSU symbol missing from vmlinux: $sym"
+                exit 1
+              fi
+            done
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              for sym in susfs_add_sus_path susfs_add_sus_map susfs_set_hide_sus_mnts_for_non_su_procs; do
+                if ! nm_has "$sym"; then
+                  echo "::error::SUSFS symbol missing from vmlinux: $sym"
+                  exit 1
+                fi
+              done
+            fi
+          fi
+          test -f out/arch/arm64/boot/Image
+          mkdir -p dist
+          echo "Kernel release: $(cat out/include/config/kernel.release)"
+          echo "KSU_REL=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp out/arch/arm64/boot/Image ak3/Image
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' ak3/anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=gta4lve + SukiSU-Ultra + SUSFS + NoMount/' ak3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=boot;/' ak3/anykernel.sh
+          (cd ak3 && zip -r9 "../dist/gta4lve-SukiSU-${KSU_REL}.zip" . -x '*.git*')
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4lve-sukisu-ultra
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-sukisu
+          path: build.log
+          if-no-files-found: ignore
